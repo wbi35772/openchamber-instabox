@@ -25,8 +25,7 @@ $log = Join-Path $DataDir 'recycle-task.log'
 $cmd = '/c ""{0}" "{1}" --once >> "{2}" 2>&1"' -f $node, $cli, $log
 $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $cmd
 $logon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$repeat = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes $Minutes)
-$logon.Repetition = $repeat.Repetition
+$repeat = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) -RepetitionInterval (New-TimeSpan -Minutes $Minutes)
 $settings = New-ScheduledTaskSettingsSet `
   -StartWhenAvailable `
   -AllowStartIfOnBatteries `
@@ -37,7 +36,7 @@ $settings = New-ScheduledTaskSettingsSet `
 Register-ScheduledTask `
   -TaskName $TaskName `
   -Action $action `
-  -Trigger $logon `
+  -Trigger $logon, $repeat `
   -Settings $settings `
   -Description 'Recycle Instabox machines before the free-plan max-run cooldown (Instabox Matrix).' `
   -Force | Out-Null
