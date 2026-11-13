@@ -20,7 +20,7 @@ if (-not (Test-Path $cli)) {
 }
 $node = (Get-Command node.exe -ErrorAction Stop).Source
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
-$log = Join-Path $DataDir 'recycle.log'
+$log = Join-Path $DataDir 'recycle-task.log'
 
 $cmd = '/c ""{0}" "{1}" --once >> "{2}" 2>&1"' -f $node, $cli, $log
 $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $cmd
