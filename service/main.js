@@ -2,9 +2,11 @@
 
 const http = require('node:http');
 const crypto = require('node:crypto');
+const path = require('node:path');
 const store = require('../lib/store');
 const { InstaboxClient, InstaboxError } = require('../lib/instabox');
 const { createKeepalive } = require('../lib/keepalive');
+const { createRecycler, buildRecycleView } = require('../lib/recycle');
 const { createJobs } = require('../lib/jobs');
 const { createNetProbe } = require('../lib/netprobe');
 const inventory = require('../lib/inventory');
@@ -31,10 +33,33 @@ if (!PORT || !TOKEN) {
 const proxies = createAccountProxy({ getState: () => store.load(), log });
 const rateLimiter = createRateLimiter();
 const jobs = createJobs();
+const recycler = createRecycler({
+  getState: () => store.load(),
+  saveStatus: (patch) => store.update((state) => {
+    store.upsertRecycleStatus(state, patch);
+    return true;
+  }),
+  directClientFor: (alias) => {
+    const state = store.load();
+    const account = store.findAccount(state, alias);
+    if (!account) return null;
+    return InstaboxClient.fromAccount(account, state.settings, {});
+  },
+  proxyClientFor: (alias) => {
+    const state = store.load();
+    const account = store.findAccount(state, alias);
+    if (!account) return null;
+    const fetchImpl = proxies.fetchFor(account.alias);
+    return InstaboxClient.fromAccount(account, state.settings, fetchImpl ? { fetchImpl } : {});
+  },
+  lockPath: path.join(store.DATA_DIR, 'recycle.lock'),
+  log,
+});
 const keepalive = createKeepalive({
   log,
   rateLimiter,
   clientFor: (alias) => clientForAccount(store.findAccount(store.load(), alias), store.load()),
+  isBusy: (account, machineId) => recycler.isBusy(account, machineId),
 });
 const netprobe = createNetProbe();
 const terminals = createTerminalManager({ log });
@@ -472,6 +497,65 @@ async function route(req, res, url) {
   if (method === 'POST' && path === '/api/keepalive/tick') {
     const patches = await keepalive.tick();
     return send(res, 200, { ok: true, patches });
+  }
+
+  if (method === 'GET' && path === '/api/recycle') {
+    return send(res, 200, { ok: true, recycle: buildRecycleView(store.load(), Date.now()) });
+  }
+
+  if (method === 'PUT' && path === '/api/recycle') {
+    const body = await readBody(req);
+    const machineInput = body.machine && typeof body.machine === 'object' ? body.machine : null;
+    if (machineInput && (!machineInput.account || !machineInput.machineId)) {
+      throw new InstaboxError('缺少 machine.account 或 machine.machineId', { code: 'bad_request', status: 400 });
+    }
+    await store.update((state) => {
+      const current = (state.settings && state.settings.recycle) || {};
+      state.settings.recycle = store.normalizeRecycleSettings({
+        ...current,
+        ...(body.enabled !== undefined ? { enabled: body.enabled } : {}),
+        ...(body.leadMinutes !== undefined ? { leadMinutes: body.leadMinutes } : {}),
+        ...(body.minUptimeMinutes !== undefined ? { minUptimeMinutes: body.minUptimeMinutes } : {}),
+        ...(body.pollMinutes !== undefined ? { pollMinutes: body.pollMinutes } : {}),
+        ...(body.verifyTimeoutMs !== undefined ? { verifyTimeoutMs: body.verifyTimeoutMs } : {}),
+        ...(body.bootstrapTimeoutSeconds !== undefined
+          ? { bootstrapTimeoutSeconds: body.bootstrapTimeoutSeconds }
+          : {}),
+      });
+      if (machineInput) {
+        store.setRecycleConfig(state, {
+          account: machineInput.account,
+          machineId: machineInput.machineId,
+          ...(machineInput.enabled !== undefined ? { enabled: machineInput.enabled } : {}),
+          ...(machineInput.verifyCommand !== undefined ? { verifyCommand: machineInput.verifyCommand } : {}),
+          ...(machineInput.bootstrapCommand !== undefined ? { bootstrapCommand: machineInput.bootstrapCommand } : {}),
+          ...(machineInput.snapshotBeforeFirst !== undefined
+            ? { snapshotBeforeFirst: machineInput.snapshotBeforeFirst }
+            : {}),
+          ...(machineInput.proxyExitExpect !== undefined ? { proxyExitExpect: machineInput.proxyExitExpect } : {}),
+        });
+      }
+      return true;
+    });
+    return send(res, 200, { ok: true, recycle: buildRecycleView(store.load(), Date.now()) });
+  }
+
+  if (method === 'POST' && path === '/api/recycle/run') {
+    const body = await readBody(req);
+    const account = String(body.account || '').trim();
+    const machineId = String(body.machineId || '').trim();
+    if (!account || !machineId) {
+      throw new InstaboxError('缺少 account 或 machineId', { code: 'bad_request', status: 400 });
+    }
+    const config = store.findRecycleConfig(store.load(), account, machineId);
+    if (!config) {
+      throw new InstaboxError('该机器未配置自动回收', { code: 'recycle_not_configured', status: 400 });
+    }
+    if (recycler.isBusy(account, machineId)) {
+      throw new InstaboxError('自动回收正在进行', { code: 'recycle_busy', status: 409 });
+    }
+    const outcome = await recycler.runNow(account, machineId, { force: body.force === true });
+    return send(res, 200, { ok: outcome.status === 'idle', result: outcome });
   }
 
   if (method === 'GET' && parts[0] === 'api' && parts[1] === 'jobs' && parts[2]) {
