@@ -1473,6 +1473,138 @@
     ].join('');
   }
 
+  function recycleStateLabel(status) {
+    var map = {
+      idle: ['空闲', 'ok'],
+      suspending: ['暂停中', 'warn'],
+      suspended: ['已暂停', 'warn'],
+      resuming: ['恢复中', 'warn'],
+      verifying: ['验收中', 'warn'],
+      bootstrapping: ['自举中', 'warn'],
+      degraded: ['验收未通过', 'bad'],
+      race_cooldown: ['平台冷却中', 'bad'],
+      failed: ['失败', 'bad'],
+    };
+    return map[status] || [status || '未运行', ''];
+  }
+
+  function recyclePanel(machine) {
+    return [
+      '<div class="recycle-box" id="recycle-box" data-account="' + esc(machine.account) + '" data-machine="' + esc(machine.id) + '">',
+      loadingRow('读取回收配置…'),
+      '</div>',
+    ].join('');
+  }
+
+  function recycleBlock(machine, view) {
+    var entry = null;
+    (view.machines || []).some(function (item) {
+      if (item.account === machine.account && item.machineId === machine.id) { entry = item; return true; }
+      return false;
+    });
+    var status = (entry && entry.status) || {};
+    var label = recycleStateLabel(status.status);
+    var lastResult = status.lastResult && status.lastResult.summary
+      ? status.lastResult.summary
+      : (status.lastError || '—');
+    var parts = [];
+    parts.push('<div class="divider"></div>');
+    parts.push('<div class="recycle-head"><strong>自动回收</strong>'
+      + '<span class="badge ' + (view.enabled ? (entry && entry.enabled ? 'ok' : '') : '') + '">'
+      + (view.enabled ? (entry ? (entry.enabled ? '本机已启用' : '本机已停用') : '未配置') : '全局关闭') + '</span></div>');
+    parts.push('<div class="hint">到达最长运行时间前自动执行暂停→恢复，并验收业务恢复，避免免费计划强制冷却。</div>');
+    parts.push('<div class="recycle-form">');
+    parts.push('<div class="checkbox-field"><input type="checkbox" id="recycle-global"' + (view.enabled ? ' checked' : '') + ' /><label for="recycle-global">启用自动回收（全局）</label></div>');
+    parts.push('<div class="checkbox-field"><input type="checkbox" id="recycle-enabled"' + (entry && entry.enabled ? ' checked' : '') + ' /><label for="recycle-enabled">本机启用</label></div>');
+    parts.push(field('验收命令（必填，通过才会暂停）', '<textarea class="input mono" id="recycle-verify" rows="2" spellcheck="false" placeholder="docker ps --filter name=app --format &quot;{{.State}}&quot; | grep -q running">' + esc(entry ? entry.verifyCommand : '') + '</textarea>'));
+    parts.push(field('自举命令（可选，验收失败后执行一次）', '<textarea class="input mono" id="recycle-bootstrap" rows="2" spellcheck="false" placeholder="cd /opt/app && docker compose up -d">' + esc(entry ? entry.bootstrapCommand : '') + '</textarea>'));
+    parts.push('<div class="checkbox-field"><input type="checkbox" id="recycle-snapshot"' + (entry && entry.snapshotBeforeFirst ? ' checked' : '') + ' /><label for="recycle-snapshot">暂停前创建快照</label></div>');
+    parts.push('</div>');
+    parts.push('<div class="meta-grid">'
+      + metaItem('回收状态', label[0], label[1])
+      + metaItem('下次到点', status.nextAt ? fmtDate(status.nextAt) : '—')
+      + metaItem('上次回收', status.lastRecycleAt ? fmtDate(status.lastRecycleAt) : '—')
+      + metaItem('上次结果', String(lastResult).slice(0, 120), status.lastError ? 'bad' : '')
+      + metaItem('连续失败', String(status.consecutiveFailures || 0), status.consecutiveFailures ? 'warn' : '')
+      + '</div>');
+    parts.push('<div class="recycle-actions">'
+      + '<button class="ghost-btn" data-act="save-recycle" data-account="' + esc(machine.account) + '" data-machine="' + esc(machine.id) + '">保存回收配置</button>'
+      + '<button class="primary-btn" data-act="run-recycle" data-account="' + esc(machine.account) + '" data-machine="' + esc(machine.id) + '">立即回收</button>'
+      + '</div>');
+    return parts.join('');
+  }
+
+  async function loadRecyclePanel(machine) {
+    var box = $('#recycle-box');
+    if (!box) return;
+    try {
+      var data = await service('GET', '/api/recycle', { timeoutMs: 30000 });
+      if (!detailOpen(machine, 'overview')) return;
+      box.innerHTML = recycleBlock(machine, (data && data.recycle) || {});
+    } catch (error) {
+      if (!detailOpen(machine, 'overview')) return;
+      box.innerHTML = '<div class="status-line bad">' + esc(describeError(error)) + '</div>';
+    }
+  }
+
+  function saveRecycle(el) {
+    var account = el.dataset.account;
+    var machineId = el.dataset.machine;
+    var globalBox = $('#recycle-global');
+    var enabledBox = $('#recycle-enabled');
+    var verifyInput = $('#recycle-verify');
+    var bootstrapInput = $('#recycle-bootstrap');
+    var snapshotBox = $('#recycle-snapshot');
+    return withButton(el, async function () {
+      var data = await service('PUT', '/api/recycle', {
+        body: {
+          enabled: Boolean(globalBox && globalBox.checked),
+          machine: {
+            account: account,
+            machineId: machineId,
+            enabled: Boolean(enabledBox && enabledBox.checked),
+            verifyCommand: verifyInput ? verifyInput.value : '',
+            bootstrapCommand: bootstrapInput ? bootstrapInput.value : '',
+            snapshotBeforeFirst: Boolean(snapshotBox && snapshotBox.checked),
+          },
+        },
+        timeoutMs: 30000,
+      });
+      var box = $('#recycle-box');
+      var modal = state.modal;
+      if (box && modal && modal.machine && modal.machine.id === machineId) {
+        box.innerHTML = recycleBlock(modal.machine, (data && data.recycle) || {});
+      }
+      toast('回收配置已保存', 'success');
+    }).catch(function (error) {
+      toast(describeError(error), 'error');
+    });
+  }
+
+  function runRecycleNow(el) {
+    var account = el.dataset.account;
+    var machineId = el.dataset.machine;
+    var modal = state.modal;
+    if (!modal || !modal.machine || modal.machine.id !== machineId) return;
+    if (!window.confirm('立即回收？机器会暂停约 1-3 分钟，然后自动恢复并验收。')) return;
+    return withButton(el, async function () {
+      toast('回收开始：暂停 → 恢复 → 验收', 'info');
+      var data = await service('POST', '/api/recycle/run', {
+        body: { account: account, machineId: machineId, force: true },
+        timeoutMs: 900000,
+      });
+      var result = (data && data.result) || {};
+      var ok = result.status === 'idle' && result.verified === true;
+      toast(ok ? '回收完成，业务验收通过' : '回收结束：' + (result.error || result.status || '未知'), ok ? 'success' : 'error');
+      if (state.modal && state.modal.kind === 'detail') {
+        clearDetailTimer();
+        renderModal();
+      }
+    }).catch(function (error) {
+      toast(describeError(error), 'error');
+    });
+  }
+
   var MANIFEST_EXAMPLE = JSON.stringify({
     apps: [{ name: '示例应用', url: 'https://example.com', username: 'admin', password: 'change-me', notes: '控制台' }],
   }, null, 2);
@@ -2229,7 +2361,8 @@
     var body = $('#detail-body');
     if (!body) return;
     if (tab === 'overview') {
-      body.innerHTML = detailOverview(machine);
+      body.innerHTML = detailOverview(machine) + recyclePanel(machine);
+      void loadRecyclePanel(machine);
       return;
     }
     if (tab === 'terminal') {
@@ -3154,6 +3287,8 @@
       if (act === 'restore-snapshot') { restoreSnapshot(el); return; }
       if (act === 'publish-port') { publishPort(el); return; }
       if (act === 'refresh-ports') { loadPorts(el.dataset.machine, el.dataset.account); return; }
+      if (act === 'save-recycle') { saveRecycle(el); return; }
+      if (act === 'run-recycle') { runRecycleNow(el); return; }
       if (act === 'scan-inventory') { scanInventoryAction(el); return; }
       if (act === 'reveal-pass') { revealPass(el); return; }
       if (act === 'unpublish-port') { unpublishPort(el); return; }

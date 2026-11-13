@@ -1115,3 +1115,10 @@ button:disabled {
 .matrix-results { margin: 8px 0 0; max-height: 240px; overflow: auto; background: var(--bg-soft); border: 1px solid var(--line); border-radius: 10px; padding: 10px; font-family: var(--mono); font-size: 11.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; display: block; }
 .matrix-results:empty { display: none; }
 textarea.input { resize: vertical; min-height: 70px; }
+
+/* recycle */
+.recycle-box { margin-top: 4px; }
+.recycle-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0 0 6px; }
+.recycle-form { display: flex; flex-direction: column; gap: 8px; margin: 10px 0; }
+.recycle-form textarea.input { width: 100%; min-height: 54px; resize: vertical; }
+.recycle-actions { display: flex; gap: 8px; margin-top: 10px; }
