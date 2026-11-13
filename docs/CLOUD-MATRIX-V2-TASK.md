@@ -415,3 +415,12 @@ curl -sS -x http://127.0.0.1:24001 https://api.ipify.org --max-time 5
 - 服务实测（测试实例 `:47991`，`OPENCHAMBER_SERVICE_TOKEN`）：`/health` ok；`GET /api/matrix` → `{ok:true,meta:[]}`；`PUT /api/matrix/meta` 写入 `proxygate/exit/#prod #exit` 成功并可回读；无 token 返回 401。
 - 已验证 `matrix_tag list/set` 在安装副本上可用（tag 回显 `proxygate · exit · #prod #exit`）。
 
+## 自动回收（2026-11-13）
+
+- 机制：max-run 到点前 lead（默认 maxRun 的 10%，clamp 10–30 分钟）先跑 `verifyCommand` 基线；通过才 `suspend → resume`，轮询 running 后走代理验收；失败先跑 `bootstrapCommand` 再验，仍失败记 `degraded`，绝不带病暂停。
+- 双入口：OpenChamber 内 keepalive tick（回收窗口内 `isBusy` 自动让路）与 Windows 计划任务 `OpenChamber-InstaboxRecycle`（AtLogOn + 每 5 分钟，`node scripts/recycle.js --once`）。
+- 状态与锁：`state.recycle` 持久化配置/运行态；`recycle.lock` 带心跳与 owner token 防并发；每轮先 RECONCILE，进程中断后下一轮自动 resume 并验收。
+- 面板：机器详情「自动回收」块（全局/本机开关、verify/bootstrap 命令、下次到点、上次结果、立即回收）。
+- 真机：proxygate 两次 `--force` 回收成功（05:41Z / 05:45Z）；第二次新 `runStartedAt=05:45:00Z`、`nextAt=07:33Z`（+108 分钟）、`lastResult={ok:true,exitCode:0,summary:"verify ok"}`；代理出口 35.88.80.47、公网 healthz HTTP 200。修复 `nextAt` 持久化与 `lastResult` 结构化两个缺陷（1275719）。
+- 计划任务手动触发输出 `reason:"uptime_low"`、`LastTaskResult=0`，任务日志独立为 `recycle-task.log`（e48c314）；`node --test` 179 pass / 0 fail；`sync.mjs --check` 与运行副本一致。
+- 待办：07:33Z 观察自动到点一轮，确认无 `cooldownUntil`；面板改动需重启 OpenChamber 后可见。
