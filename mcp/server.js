@@ -1,9 +1,11 @@
 'use strict';
 
+const path = require('node:path');
 const readline = require('node:readline');
 const store = require('../lib/store');
 const { InstaboxClient, InstaboxError } = require('../lib/instabox');
 const { createKeepalive } = require('../lib/keepalive');
+const { buildRecycleView, createRecycler } = require('../lib/recycle');
 const { createNetProbe } = require('../lib/netprobe');
 const inventory = require('../lib/inventory');
 const inventoryProbe = require('../lib/inventory-probe');
@@ -111,6 +113,25 @@ async function resolveMachineId(api, value) {
 const netprobe = createNetProbe();
 const proxies = createAccountProxy({ getState: () => store.load(), log });
 const rateLimiter = createRateLimiter();
+
+const recycler = createRecycler({
+  getState: () => store.load(),
+  saveStatus: (patch) => store.update((draft) => {
+    store.upsertRecycleStatus(draft, patch);
+  }),
+  directClientFor: (alias) => {
+    const state = store.load();
+    const account = store.findAccount(state, alias);
+    return account ? InstaboxClient.fromAccount(account, state.settings, {}) : null;
+  },
+  proxyClientFor: (alias) => {
+    const state = store.load();
+    const account = store.findAccount(state, alias);
+    return account ? client(account, state) : null;
+  },
+  lockPath: path.join(store.DATA_DIR, 'recycle.lock'),
+  log,
+});
 
 async function proxyTool(args) {
   const operation = String(args.operation || 'status');
@@ -451,6 +472,28 @@ const TOOLS = [
         token: { type: 'string', description: 'Viewer token for stream_state (the part after #token= in the URL).' },
       },
       required: ['operation', 'machine_id'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'instabox_recycle',
+    description: 'Automatic pre-max-run recycle: suspend then resume a machine before the platform max-run limit, verify the workload recovered, and avoid the free-plan cooldown. status lists config and next run; set stores verify/bootstrap commands (a machine without a verify command is never suspended); run recycles now.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        operation: { type: 'string', enum: ['status', 'set', 'run'] },
+        account: { type: 'string', description: 'Account alias; omit for the active account on set/run.' },
+        machine_id: { type: 'string', description: 'Sandbox ID (m_...) or exact sandbox name.' },
+        enabled: { type: 'boolean', description: 'Enable recycle for this machine (set).' },
+        verify_command: { type: 'string', description: 'Shell command that exits 0 only when every workload is healthy.' },
+        bootstrap_command: { type: 'string', description: 'Command that restarts workloads after resume if verify fails.' },
+        proxy_exit_expect: { type: 'string', description: 'Optional expected proxy egress marker.' },
+        snapshot_before_first: { type: 'boolean', description: 'Take a snapshot before the first recycle.' },
+        lead_minutes: { type: 'integer', minimum: 5, maximum: 120, description: 'Global lead time before the max run; omit for 10% clamped to 10-30 minutes.' },
+        min_uptime_minutes: { type: 'integer', minimum: 0, maximum: 1440, description: 'Global minimum runtime before a recycle is allowed.' },
+        force: { type: 'boolean', description: 'run: recycle even when not due.' },
+      },
+      required: ['operation'],
       additionalProperties: false,
     },
   },
@@ -925,6 +968,7 @@ async function keepaliveTool(args) {
   const keepalive = createKeepalive({
     clientFor: (alias) => client(resolveAccount(store.load(), alias), store.load()),
     rateLimiter,
+    isBusy: (alias, id) => recycler.isBusy(alias, id),
   });
 
   if (operation === 'clear') {
@@ -1309,6 +1353,83 @@ async function desktopTool(args) {
   return ok(lines.join('\n'));
 }
 
+async function recycleTool(args) {
+  const operation = String(args.operation || 'status');
+  const state = store.load();
+
+  if (operation === 'status') {
+    const view = buildRecycleView(state, Date.now());
+    const lines = [
+      `自动回收：${view.enabled ? '开' : '关'} · lead ${view.leadMinutes === null ? '自动（10%-30 分钟）' : `${view.leadMinutes} 分钟`} · 最短运行 ${view.minUptimeMinutes} 分钟 · 轮询 ${view.pollMinutes} 分钟`,
+    ];
+    if (!view.machines.length) {
+      lines.push('还没有配置任何机器。用 operation=set 写 verify_command 后才可能暂停。');
+      return ok(lines.join('\n'));
+    }
+    const rows = view.machines.map((entry) => {
+      const status = entry.status || {};
+      const next = status.nextAt ? String(status.nextAt).replace('T', ' ').slice(0, 19) : '—';
+      const last = status.lastRecycleAt ? String(status.lastRecycleAt).replace('T', ' ').slice(0, 19) : '—';
+      return `| ${entry.account} | ${entry.machineId} | ${entry.enabled ? '开' : '关'} | ${status.status || 'idle'} | ${next} | ${last} | ${entry.verifyCommand ? '已配置' : '缺 verify'} | ${status.lastError ? `⚠ ${String(status.lastError).slice(0, 60)}` : 'ok'} |`;
+    });
+    lines.push('| 账号 | 机器 | 开关 | 状态 | 下次到点 | 上次回收 | 验收 | 最近错误 |', '| --- | --- | --- | --- | --- | --- | --- | --- |', ...rows);
+    return ok(lines.join('\n'));
+  }
+
+  if (operation === 'set') {
+    if (!args.machine_id) return fail('需要 machine_id。');
+    const account = resolveAccount(state, args.account);
+    const api = client(account, state);
+    const machineId = await resolveMachineId(api, args.machine_id);
+    let saved = null;
+    let verifyEmpty = false;
+    await store.update((draft) => {
+      const recycle = draft.settings.recycle;
+      if (args.lead_minutes !== undefined) recycle.leadMinutes = args.lead_minutes;
+      if (args.min_uptime_minutes !== undefined) recycle.minUptimeMinutes = args.min_uptime_minutes;
+      draft.settings.recycle = store.normalizeRecycleSettings(recycle);
+      const patch = { account: account.alias, machineId };
+      if (args.enabled !== undefined) patch.enabled = Boolean(args.enabled);
+      if (args.verify_command !== undefined) patch.verifyCommand = String(args.verify_command);
+      if (args.bootstrap_command !== undefined) patch.bootstrapCommand = String(args.bootstrap_command);
+      if (args.proxy_exit_expect !== undefined) patch.proxyExitExpect = String(args.proxy_exit_expect);
+      if (args.snapshot_before_first !== undefined) patch.snapshotBeforeFirst = Boolean(args.snapshot_before_first);
+      saved = store.setRecycleConfig(draft, patch);
+      verifyEmpty = !saved || !saved.verifyCommand;
+    });
+    if (!saved) return fail('保存回收配置失败。');
+    return ok([
+      `已保存回收配置：${saved.account}/${saved.machineId}`,
+      `- 开关：${saved.enabled ? '开' : '关'}`,
+      `- 验收命令：${saved.verifyCommand ? '已配置' : '空（未配置验收命令的机器绝不会被暂停）'}`,
+      `- 重启命令：${saved.bootstrapCommand ? '已配置' : '无'}`,
+      ...(verifyEmpty ? ['', '注意：验收命令为空，这台机器不会被自动回收。'] : []),
+    ].join('\n'));
+  }
+
+  if (operation === 'run') {
+    if (!args.machine_id) return fail('需要 machine_id。');
+    const account = resolveAccount(state, args.account);
+    const api = client(account, state);
+    const machineId = await resolveMachineId(api, args.machine_id);
+    const config = store.findRecycleConfig(store.load(), account.alias, machineId);
+    if (!config) return fail(`机器未配置自动回收：${machineId}。先用 operation=set 写 verify_command。`);
+    if (!config.verifyCommand) return fail(`机器没有验收命令，拒绝暂停：${machineId}。`);
+    if (config.enabled === false) return fail(`机器已关闭自动回收：${machineId}。先 set enabled=true。`);
+    const result = await recycler.runNow(account.alias, machineId, { force: true });
+    const lines = [
+      `回收 ${account.alias}/${machineId}：${result.status}`,
+      `- 已恢复：${result.resumed ? '是' : '否'}`,
+      `- 验收：${result.verified ? '通过' : '未通过'}`,
+    ];
+    if (result.error) lines.push(`- 原因：${result.error}`);
+    if (result.machine && result.machine.runStartedAt) lines.push(`- 新 runStartedAt：${result.machine.runStartedAt}`);
+    return result.status === 'idle' ? ok(lines.join('\n')) : fail(lines.join('\n'));
+  }
+
+  return fail(`未知 operation：${operation}`);
+}
+
 async function callTool(name, args) {
   switch (name) {
     case 'instabox_list_machines': return listMachines(args);
@@ -1330,6 +1451,7 @@ async function callTool(name, args) {
     case 'instabox_files': return filesTool(args);
     case 'instabox_ssh_token': return sshTokenTool(args);
     case 'instabox_desktop': return desktopTool(args);
+    case 'instabox_recycle': return recycleTool(args);
     default: return fail(`未知工具：${name}`);
   }
 }
