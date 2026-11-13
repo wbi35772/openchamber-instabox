@@ -38,3 +38,10 @@ test('due only inside the lead window and never in cooldown', () => {
   assert.equal(planRecycle({ machine: { ...base, state: 'suspended' }, config, status: {}, now }).reason, 'not_running');
   assert.equal(planRecycle({ machine: { ...base, runStartedAt: '2026-11-13T07:10:00Z' }, config, status: {}, now }).reason, 'uptime_low');
 });
+
+test('a recycled run becomes due again at its own next cadence', () => {
+  const status = { lastRunStartedAt: base.runStartedAt, lastRecycleAt: '2026-11-13T00:05:00Z' };
+  assert.equal(planRecycle({ machine: base, config, status, now }).due, true);
+  const fresh = { lastRunStartedAt: base.runStartedAt, lastRecycleAt: '2026-11-13T07:00:00Z' };
+  assert.equal(planRecycle({ machine: base, config, status: fresh, now }).reason, 'already_recycled');
+});
