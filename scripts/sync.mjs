@@ -8,7 +8,13 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const EXTENSION_ID = 'instabox-matrix';
-const COPY_FILES = ['package.json', 'icon.svg', 'README.md'];
+const COPY_FILES = [
+  'package.json',
+  'icon.svg',
+  'README.md',
+  'scripts/recycle.js',
+  'scripts/install-recycle-task.ps1',
+];
 const COPY_DIRS = ['lib', 'service', 'mcp', 'panel'];
 
 function usage() {
