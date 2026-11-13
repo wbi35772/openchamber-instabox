@@ -42,3 +42,17 @@ test('setRecycleConfig keeps disabled command and removeAccount cascades', () =>
   assert.equal(store.findRecycleConfig(state, 'wbi', 'm_1'), null);
   assert.equal(store.findRecycleStatus(state, 'wbi', 'm_1'), null);
 });
+
+test('upsertRecycleStatus preserves the structured lastResult', () => {
+  const state = store.load();
+  store.upsertRecycleStatus(state, {
+    account: 'wbi',
+    machineId: 'm_2',
+    status: 'idle',
+    lastResult: { at: '2026-11-13T00:00:00Z', ok: true, exitCode: 0, summary: 'verify ok' },
+  });
+  const entry = store.findRecycleStatus(state, 'wbi', 'm_2');
+  assert.equal(entry.lastResult.summary, 'verify ok');
+  assert.equal(entry.lastResult.ok, true);
+  assert.equal(entry.lastResult.exitCode, 0);
+});
