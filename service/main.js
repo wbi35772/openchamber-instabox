@@ -2,7 +2,9 @@
 
 const http = require('node:http');
 const crypto = require('node:crypto');
+const os = require('node:os');
 const path = require('node:path');
+const EXTENSION_ROOT = path.resolve(__dirname, '..');
 const store = require('../lib/store');
 const { InstaboxClient, InstaboxError } = require('../lib/instabox');
 const { createKeepalive } = require('../lib/keepalive');
@@ -14,12 +16,18 @@ const { createTerminalManager } = require('../lib/terminal');
 const { createAccountProxy } = require('../lib/account-proxy');
 const { createRateLimiter } = require('../lib/ratelimit');
 const { createScheduler } = require('../lib/scheduler');
+const selfUpdate = require('../lib/self-update');
+const canvas = require('../lib/canvas');
+const canvasPage = require('../lib/canvas-page');
 
 const PORT = Number(process.env.OPENCHAMBER_SERVICE_PORT || 0);
 const TOKEN = String(process.env.OPENCHAMBER_SERVICE_TOKEN || '');
 const HOST = '127.0.0.1';
 const BODY_LIMIT = 2 * 1024 * 1024;
 const MAX_UPLOAD_BYTES = 4 * 1024 * 1024;
+const EXTENSION_DIR = path.resolve(__dirname, '..');
+const REGISTRY_FILE = path.join(os.homedir(), '.config', 'openchamber', 'extensions.json');
+const EXTENSION_VERSION = require('../package.json').version;
 
 function log(message) {
   try { process.stderr.write(`[instabox-matrix] ${message}\n`); } catch { /* ignore */ }
@@ -264,6 +272,7 @@ async function route(req, res, url) {
     const state = store.load();
     return send(res, 200, {
       ok: true,
+      version: EXTENSION_VERSION,
       settings: state.settings,
       accounts: state.accounts.map(store.publicAccount),
       keepalive: state.keepalive,
@@ -316,9 +325,77 @@ async function route(req, res, url) {
     if (body.proxy !== undefined) {
       state.settings.proxy = store.normalizeProxySettings(body.proxy);
     }
+    if (body.update !== undefined) {
+      state.settings.update = store.normalizeUpdateSettings({
+        ...state.settings.update,
+        ...(body.update && typeof body.update === 'object' ? body.update : {}),
+      });
+    }
     store.save(state);
     proxies.closeAll();
     return send(res, 200, { ok: true, settings: state.settings });
+  }
+
+  if (method === 'GET' && path === '/api/update/status') {
+    const state = store.load();
+    return send(res, 200, {
+      ok: true,
+      currentVersion: selfUpdate.currentVersion(EXTENSION_DIR),
+      update: state.settings.update,
+    });
+  }
+
+  if (method === 'POST' && path === '/api/update/check') {
+    const state = store.load();
+    try {
+      const result = await selfUpdate.check({
+        update: state.settings.update,
+        installDir: EXTENSION_DIR,
+        timeoutMs: 180000,
+        log,
+      });
+      await store.update((draft) => {
+        draft.settings.update = store.normalizeUpdateSettings({
+          ...draft.settings.update,
+          lastCheck: {
+            at: result.checkedAt,
+            currentVersion: result.currentVersion,
+            latestVersion: result.latestVersion,
+            available: result.available,
+            commit: result.commit,
+            error: '',
+          },
+        });
+      });
+      return send(res, 200, { ok: true, ...result, update: store.load().settings.update });
+    } catch (error) {
+      await store.update((draft) => {
+        draft.settings.update = store.normalizeUpdateSettings({
+          ...draft.settings.update,
+          lastCheck: {
+            at: new Date().toISOString(),
+            currentVersion: selfUpdate.currentVersion(EXTENSION_DIR),
+            latestVersion: '',
+            available: false,
+            commit: '',
+            error: String(error && error.message ? error.message : error),
+          },
+        });
+      });
+      throw error;
+    }
+  }
+
+  if (method === 'POST' && path === '/api/update/apply') {
+    const state = store.load();
+    const result = await selfUpdate.apply({
+      update: state.settings.update,
+      installDir: EXTENSION_DIR,
+      registry: REGISTRY_FILE,
+      timeoutMs: 300000,
+      log,
+    });
+    return send(res, 200, { ok: true, ...result });
   }
 
   if (method === 'GET' && path === '/api/proxy/status') {
@@ -750,6 +827,75 @@ async function route(req, res, url) {
           ttlMs: inventory.INVENTORY_TTL_MS,
         });
       }
+    }
+
+    if (rest[0] === 'canvas' && rest.length === 1 && method === 'POST') {
+      const body = await readBody(req);
+      const [machine, connection, rawPorts] = await Promise.all([
+        client.getMachine(machineId),
+        client.connectionInfo(machineId).catch(() => null),
+        cachedPorts(client, alias, machineId),
+      ]);
+      const running = machine && machine.state === 'running';
+      let inventoryData = inventoryCache.get(`${alias}:${machineId}`) || null;
+      const warnings = [];
+      const wantScan = body.refresh === true || body.scan === true;
+      if (running && (wantScan || !inventoryData)) {
+        try {
+          inventoryData = await inventory.scanInventory(client, machineId, {
+            timeoutSeconds: Math.max(15, Math.min(180, Number(body.timeoutSeconds) || 90)),
+          });
+          inventoryCache.set(`${alias}:${machineId}`, inventoryData);
+        } catch (error) {
+          warnings.push('扫描服务清单失败：' + error.message);
+        }
+      } else if (!inventoryData) {
+        warnings.push('机器未运行，未扫描服务清单。');
+      }
+      const recycleView = buildRecycleView(state, Date.now());
+      const recycle = (recycleView.machines || []).find(
+        (entry) => entry.account === alias && entry.machineId === machineId,
+      ) || null;
+      const html = canvasPage.buildMachineCanvasHtml({
+        machine: Object.assign({}, machine, { account: alias }),
+        account: alias,
+        connection: running ? connection : null,
+        ports: Array.isArray(rawPorts) ? rawPorts : (rawPorts && Array.isArray(rawPorts.ports) ? rawPorts.ports : []),
+        inventory: inventoryData,
+        keepalive: keepaliveFor(state, alias, machineId),
+        recycle,
+        warnings,
+      });
+      const published = await canvas.publishArtifact({
+        title: '机器画布 · ' + (machine.name || machineId),
+        html,
+        dedupeKey: 'instabox-matrix:machine-canvas:' + alias + ':' + machineId,
+        directory: process.env.CANVAS_DIRECTORY || EXTENSION_ROOT,
+        tags: ['instabox', 'machine'],
+      });
+      const viewer = await canvas.ensureViewer({
+        storeRoot: canvas.defaultStoreRoot(),
+        canvasDir: canvas.defaultCanvasDir(),
+      });
+      if (published.contentChanged) {
+        await canvas.notifyViewerChanged(viewer, {
+          id: published.id,
+          version: published.version,
+        }).catch(() => {});
+      }
+      const minted = await canvas.mintViewUrl(viewer, {
+        id: published.id,
+        version: published.version,
+      });
+      return send(res, 200, {
+        ok: true,
+        url: minted.url,
+        expiresAt: minted.expiresAt,
+        artifactId: published.id,
+        version: published.version,
+        contentChanged: published.contentChanged,
+        warnings,
+      });
     }
 
     if (rest[0] === 'exec' && method === 'POST') {

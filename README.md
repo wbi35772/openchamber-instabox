@@ -104,6 +104,10 @@ MCP 服务直接读取状态文件并访问 Instabox API，不依赖面板或本
 
 也可让 Agent 调用 `instabox_inventory`（`action=scaffold`）写入模板。清单只在本机面板里展示，公网端口链接来自 Instabox 端口发布记录。
 
+### 机器 Canvas
+
+机器详情的概览 tab 和弹窗底部都有「Canvas」按钮。点击后本地服务会把该机器的状态、SSH 连接、公网入口、应用清单（含账号密码与打开按钮）、监听端口、容器、systemd 服务、保活与回收信息汇总成一个 Canvas artifact，再由 canvas 扩展的 viewer 打开。刷新同一台机器时复用同一个 artifact 并追加新版本；页面里的密码默认掩码，可单条或全部显示，复制按钮走本地剪贴板。机器未运行时仍会打开 Canvas，但网络与应用清单来自上次扫描。应用清单从机器内的 `/etc/instabox-apps.json`、`/srv/instabox-apps.json`、`/data/instabox-apps.json` 或 `~/.instabox-apps.json` 读取。Canvas 访客页运行在沙箱里，链接点击改为当前画布内自导航（不使用 `target="_blank"`）；目标应用若返回 `X-Frame-Options: DENY`（例如 OpenCode2API WebUI），画布内会拒绝显示，需复制地址到浏览器打开。
+
 ## 限制
 
 - 免费计划 1 台机器、200 GiB 数据、5 个快照；创建/克隆可能返回 `429 quota_exceeded`。
@@ -125,6 +129,18 @@ MCP 服务直接读取状态文件并访问 Instabox API，不依赖面板或本
 - 异步操作返回 202 + `Operation`，轮询到 `succeeded` / `failed`。
 - 终端 WebSocket 用 `X-API-Key` 升级，PTY 二进制双向；控制消息为 JSON。
 
+## 更新
+
+设置弹窗里的「更新代理」只作用于扩展自身更新，和账号机器的代理互不影响：
+
+- **跟随系统**：`git` 使用自己的环境变量与全局配置（默认）。
+- **直连**：显式清空 `http.proxy` / `https.proxy`。
+- **自定义代理**：每次 `git` 调用都带 `-c http.proxy=... -c https.proxy=...`，支持 `http://`、`https://`、`socks5://`、`socks5h://`。
+
+「检查更新」把仓库 `--depth 1` 克隆到临时目录并比较 `package.json` 版本；「立即更新」克隆后运行仓库自带的 `scripts/sync.mjs --install-dir <扩展目录> --registry <extensions.json>`，完成后重载扩展。仓库和分支可在状态文件 `settings.update.repo` / `.ref` 中修改，默认 `wbi35772/openchamber-instabox-matrix` 的 `main`。
+
+服务端接口：`GET /api/update/status`、`POST /api/update/check`、`POST /api/update/apply`。
+
 ## 开发
 
 无依赖、无构建，Node 22+：
@@ -138,7 +154,7 @@ node scripts/sync.mjs --check
 目录：
 
 ```text
-lib/         Instabox 客户端、WebSocket、终端会话、租约、任务、状态存储
+lib/         Instabox 客户端、WebSocket、终端会话、租约、任务、状态存储、自更新
 service/     本地 HTTP 服务（面板 → 127.0.0.1 → Gateway）
 panel/       面板（IIFE + xterm vendor）
 mcp/         MCP stdio 服务

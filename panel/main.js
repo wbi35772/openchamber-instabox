@@ -375,6 +375,7 @@
   var state = {
     accounts: [],
     settings: {},
+    version: '',
     overview: null,
     error: null,
     loading: true,
@@ -440,6 +441,7 @@
       var data = await service('GET', '/api/bootstrap', { timeoutMs: 30000 });
       state.accounts = data.accounts || [];
       state.settings = data.settings || {};
+      state.version = data.version || state.version;
       if (state.selected !== 'all' && !state.accounts.some(function (a) { return a.alias === state.selected; })) {
         state.selected = 'all';
       }
@@ -472,6 +474,7 @@
       if (accountList) {
         state.accounts = accountList.accounts || state.accounts;
         state.settings = accountList.settings || state.settings;
+        state.version = accountList.version || state.version;
       }
     } catch (error) {
       state.error = error;
@@ -1189,11 +1192,35 @@
   }
 
   function renderSettingsModal(root) {
+    var upd = state.settings.update || {};
+    var channel = upd.channel || 'system';
+    var channelOptions = [
+      ['system', '跟随系统（git 环境变量 / 全局配置）'],
+      ['direct', '直连（强制忽略代理）'],
+      ['custom', '自定义代理'],
+    ].map(function (pair) {
+      return '<option value="' + pair[0] + '"' + (pair[0] === channel ? ' selected' : '') + '>' + pair[1] + '</option>';
+    }).join('');
+    var last = upd.lastCheck || null;
+    var lastText = last
+      ? (last.error
+        ? ('上次检查失败：' + last.error)
+        : (last.available
+          ? ('上次检查：发现 v' + last.latestVersion + '（当前 v' + last.currentVersion + '）')
+          : ('上次检查：已是最新 v' + last.latestVersion)))
+      : '尚未检查更新';
     var body = [
       '<div class="form-grid">',
       field('默认网关地址（全局）', '<input class="input mono" id="setting-gateway" placeholder="https://api.instabox.sh" value="' + esc(state.settings.gatewayUrl || '') + '" />'),
       '<div class="hint">所有账号的请求默认走这个地址；单个账号可以覆盖。通过本地反代或 CORS 网关时填这里。</div>',
       field('默认 Lease TTL（分钟）', '<input class="input mono" id="setting-keepalive-ttl" type="number" min="1" max="60" step="1" value="' + esc(Math.round((state.settings.defaultTtlSeconds || 900) / 60)) + '" />'),
+      '<div class="divider"></div>',
+      '<div class="hint"><b>更新代理</b>（只用于本扩展自身更新，不影响账号机器流量）</div>',
+      field('更新通道', '<select class="input" id="setting-update-channel">' + channelOptions + '</select>'),
+      field('代理地址', '<input class="input mono" id="setting-update-proxy" placeholder="http://127.0.0.1:10809 或 socks5h://127.0.0.1:1080" value="' + esc(upd.proxyUrl || '') + '" />'),
+      '<div class="hint">当前版本 <code>' + esc(state.version || '未知') + '</code>。更新会通过该通道 <code>git clone</code> 远端仓库，再用仓库自带的 <code>scripts/sync.mjs</code> 覆盖扩展文件，完成后需要重载扩展。</div>',
+      '<div class="status-line" id="update-status"><span class="grow">' + esc(lastText) + '</span></div>',
+      '<div class="status-line"><span class="grow"></span><button class="ghost-btn" data-act="check-update">检查更新</button><button class="ghost-btn" data-act="apply-update">立即更新</button></div>',
       '<div class="divider"></div>',
       '<div class="hint"><b>Agent 工具</b><br />MCP 服务注册到 <code>opencode.json</code> 的 <code>mcp.servers.instabox-matrix</code> 后可用：<br /><code>instabox_list_machines</code> · <code>instabox_create_machine</code> · <code>instabox_fork_machine</code> · <code>instabox_power_action</code> · <code>instabox_exec_command</code> · <code>instabox_manage_snapshot</code> · <code>instabox_expose_port</code> · <code>instabox_keepalive</code> · <code>instabox_network_info</code> · <code>instabox_inspect</code> · <code>instabox_list_accounts</code></div>',
       '<div class="hint">本机状态文件：<code>~/.openchamber-instabox-matrix/state.json</code>（权限 600，含 API Key，不要提交或分享）。</div>',
@@ -1415,6 +1442,7 @@
       '<div id="detail-body">' + loadingRow() + '</div>',
     ].join('');
     root.innerHTML = modalShell('机器详情 · ' + (machine.name || machine.id), 'info', body, [
+      '<button class="ghost-btn" data-act="detail-canvas" data-machine="' + esc(machine.id) + '" data-account="' + esc(machine.account) + '">' + icon('external') + 'Canvas</button>',
       '<button class="ghost-btn" data-act="refresh-detail">' + icon('refresh') + '刷新</button>',
       '<button class="ghost-btn" data-act="close-modal">关闭</button>',
     ].join(''), true);
@@ -1468,6 +1496,10 @@
       '<div class="meta-grid">' + rows.join('') + '</div>',
       ssh,
       '<div class="divider"></div>',
+      '<div class="status-line">',
+      '<span class="grow">机器画布：已部署应用、网络配置、账号密码与一键跳转入口。</span>',
+      '<button class="ghost-btn" data-act="detail-canvas" data-machine="' + esc(machine.id) + '" data-account="' + esc(machine.account) + '">' + icon('external') + '打开 Canvas</button>',
+      '</div>',
       '<div class="hint">机器 ID <code>' + esc(machine.id) + '</code></div>',
       '<div class="hint">指标、日志、历史与进程都来自 Instabox API；机器停止时日志和历史仍可读。</div>',
     ].join('');
@@ -2633,6 +2665,18 @@
     };
   }
 
+  async function openMachineCanvas(machine, button) {
+    await withButton(button, async function () {
+      var result = await service('POST', detailBase(machine) + '/canvas', {
+        body: { scan: true },
+        timeoutMs: 180000,
+      });
+      if (!result || !result.url) throw new Error('Canvas 没有返回可打开的链接');
+      openUrl(result.url);
+      toast('Canvas 已生成', 'success');
+    });
+  }
+
   async function powerAction(machine, action, button) {
     await withButton(button, async function () {
       await service('POST', '/api/machines/' + encodeURIComponent(machine.account) + '/' + encodeURIComponent(machine.id) + '/' + action, { body: {}, timeoutMs: 60000 });
@@ -3112,11 +3156,62 @@
     await withButton(button, async function () {
       var gateway = ($('#setting-gateway') || {}).value || '';
       var ttlMinutes = Math.max(1, Math.min(60, Number(($('#setting-keepalive-ttl') || {}).value) || 15));
-      var data = await service('PUT', '/api/settings', { body: { gatewayUrl: gateway.trim(), defaultTtlSeconds: ttlMinutes * 60 } });
+      var channelEl = $('#setting-update-channel');
+      var proxyEl = $('#setting-update-proxy');
+      var data = await service('PUT', '/api/settings', {
+        body: {
+          gatewayUrl: gateway.trim(),
+          defaultTtlSeconds: ttlMinutes * 60,
+          update: {
+            channel: channelEl ? channelEl.value : 'system',
+            proxyUrl: proxyEl ? proxyEl.value.trim() : '',
+          },
+        },
+      });
       state.settings = data.settings || state.settings;
       closeModal();
       toast('设置已保存', 'success');
       refresh({ silent: true });
+    });
+  }
+
+  function setUpdateStatus(text, tone) {
+    var el = $('#update-status');
+    if (!el) return;
+    el.className = 'status-line' + (tone ? ' ' + tone : '');
+    el.innerHTML = '<span class="grow">' + esc(text) + '</span>';
+  }
+
+  async function checkUpdate(button) {
+    await withButton(button, async function () {
+      setUpdateStatus('检查中：git clone 远端仓库…', '');
+      try {
+        var data = await service('POST', '/api/update/check', { timeoutMs: 200000 });
+        if (state.settings.update && data.update) state.settings.update.lastCheck = data.update.lastCheck;
+        if (data.available) {
+          setUpdateStatus('发现新版本 v' + data.latestVersion + '（当前 v' + data.currentVersion + '）', 'ok');
+          toast('发现 v' + data.latestVersion, 'success');
+        } else {
+          setUpdateStatus('已是最新 v' + data.latestVersion, 'ok');
+          toast('已是最新', 'success');
+        }
+      } catch (error) {
+        setUpdateStatus('检查失败：' + describeError(error), 'bad');
+      }
+    });
+  }
+
+  async function applyUpdate(button) {
+    if (!window.confirm('立即从远端仓库更新扩展？会覆盖当前扩展文件，完成后需要重载扩展。')) return;
+    await withButton(button, async function () {
+      setUpdateStatus('更新中：git clone + 同步文件…', '');
+      try {
+        var data = await service('POST', '/api/update/apply', { timeoutMs: 320000 });
+        setUpdateStatus('已更新到 v' + data.latestVersion + '，请重载扩展', 'ok');
+        toast('已更新到 v' + data.latestVersion + '，请重载扩展', 'success');
+      } catch (error) {
+        setUpdateStatus('更新失败：' + describeError(error), 'bad');
+      }
     });
   }
 
@@ -3245,6 +3340,10 @@
         void loadDetailTab(state.modal.machine, state.modal.tab || 'overview', true);
         return;
       }
+      if (act === 'detail-canvas') {
+        openMachineCanvas(machineFrom(el), el);
+        return;
+      }
       if (act === 'history-entry') { loadHistoryEntry(el); return; }
       if (act === 'file-open') {
         if (!state.modal || state.modal.kind !== 'detail') return;
@@ -3275,6 +3374,8 @@
       }
       if (act === 'remove-account') { removeAccount(el); return; }
       if (act === 'save-settings') { saveSettings(el); return; }
+      if (act === 'check-update') { checkUpdate(el); return; }
+      if (act === 'apply-update') { applyUpdate(el); return; }
       if (act === 'exec-fill') {
         var textarea = $('#exec-cmd');
         if (textarea) { textarea.value = el.dataset.cmd || ''; textarea.focus(); }
