@@ -59,6 +59,7 @@ node scripts/docs-canvas.js --no-viewer # 只写 artifact
 
 ## 维护约定
 
+- 变更记录：[`../CHANGELOG.md`](../CHANGELOG.md)
 - 改功能必须同时更新：`README.md` 能力列表、本索引、Canvas 全景文档。
 - 发布前：`npm test` 全绿、`node scripts/sync.mjs --check` 干净、版本号与 `package.json` 一致。
 - 通用模块（`canvas.js`、`canvas-page.js`、`proxy-fetch.js`、`ws.js`、`scheduler.js`、`ratelimit.js`）禁止依赖 Instabox 客户端或硬编码平台域名/前缀。

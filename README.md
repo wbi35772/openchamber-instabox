@@ -66,6 +66,7 @@ node scripts/keepalive-tick.js
 - 源文件：[`docs/canvas/openchamber-instabox-docs.html`](docs/canvas/openchamber-instabox-docs.html)
 - 发布到 OpenChamber Canvas：`node scripts/docs-canvas.js`
 - 文档索引：[`docs/INDEX.md`](docs/INDEX.md)
+- 变更记录：[`CHANGELOG.md`](CHANGELOG.md)
 - 零直连报告：[`docs/reports/TRANSPORT-ZERO-DIRECT-REPORT-2026-11-15.md`](docs/reports/TRANSPORT-ZERO-DIRECT-REPORT-2026-11-15.md)
 - 多账号规模与指纹分析：[`docs/reports/MULTI-ACCOUNT-SCALE-REPORT-2026-11-15.md`](docs/reports/MULTI-ACCOUNT-SCALE-REPORT-2026-11-15.md)
 
