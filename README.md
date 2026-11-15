@@ -3,6 +3,8 @@
 > 私有仓库：`wbi35772/openchamber-instabox` · 扩展 ID：`instabox-matrix` · v1.6.0
 >
 > 仓库名是 `openchamber-instabox`；为保持已安装扩展、状态目录和 MCP 配置兼容，扩展 ID 与 `~/.openchamber-instabox-matrix` 数据目录保持不变。
+>
+> 历史：旧公开仓库 `openchamber-instabox-matrix` 的 55 个提交保存在本仓库 `legacy/main` 分支。
 
 OpenChamber 的多账号 Instabox 机器矩阵扩展：一个面板管理多个账号下的沙盒机器，Node 侧出站统一走每账号代理端口，代理缺失时 fail-closed；同样的能力通过 MCP 暴露给 Agent。API Key 只保存在本机状态文件中，不进入面板页面或浏览器存储。
 
