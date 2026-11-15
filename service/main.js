@@ -47,19 +47,8 @@ const recycler = createRecycler({
     store.upsertRecycleStatus(state, patch);
     return true;
   }),
-  directClientFor: (alias) => {
-    const state = store.load();
-    const account = store.findAccount(state, alias);
-    if (!account) return null;
-    return InstaboxClient.fromAccount(account, state.settings, {});
-  },
-  proxyClientFor: (alias) => {
-    const state = store.load();
-    const account = store.findAccount(state, alias);
-    if (!account) return null;
-    const fetchImpl = proxies.fetchFor(account.alias);
-    return InstaboxClient.fromAccount(account, state.settings, fetchImpl ? { fetchImpl } : {});
-  },
+  directClientFor: (alias) => controlClientFor(alias),
+  proxyClientFor: (alias) => controlClientFor(alias),
   lockPath: path.join(store.DATA_DIR, 'recycle.lock'),
   log,
 });
@@ -147,12 +136,38 @@ function selectedAccounts(state, requested) {
   return active ? [active] : [];
 }
 
+function proxyRequired(state) {
+  return Boolean(state && state.settings && state.settings.proxy && state.settings.proxy.enabled === true);
+}
+
+function failClosedFetch(state, alias, options) {
+  if (!proxyRequired(state)) return undefined;
+  return proxies.requireFetchFor(alias, options);
+}
+
+function controlClientFor(alias) {
+  const state = store.load();
+  const account = store.findAccount(state, alias);
+  if (!account) return null;
+  try {
+    return InstaboxClient.fromAccount(account, state.settings, {
+      fetchImpl: failClosedFetch(state, alias),
+    });
+  } catch (error) {
+    if (error && error.code === 'ERR_PROXY_REQUIRED_FAIL_CLOSED') {
+      log(`blocked direct control-plane call for ${alias}: ${error.message}`);
+      return null;
+    }
+    throw error;
+  }
+}
+
 function clientForAccount(account, state) {
   if (!account) return InstaboxClient.fromAccount(account, state.settings, {});
   const limit = store.normalizeRateLimit(state.settings && state.settings.rateLimit);
   rateLimiter.configure(account.alias, limit);
   return InstaboxClient.fromAccount(account, state.settings, {
-    fetchImpl: proxies.fetchFor(account.alias),
+    fetchImpl: failClosedFetch(state, account.alias),
     rateLimiter,
     rateKey: account.alias,
   });
@@ -240,10 +255,12 @@ function identityOf(me) {
   };
 }
 
-async function testCredentials(apiKey, gatewayUrl) {
+async function testCredentials(apiKey, gatewayUrl, alias) {
+  const state = store.load();
   const client = new InstaboxClient({
     apiKey,
-    baseUrl: gatewayUrl || store.load().settings.gatewayUrl || undefined,
+    baseUrl: gatewayUrl || state.settings.gatewayUrl || undefined,
+    fetchImpl: failClosedFetch(state, String(alias || '').trim(), { candidate: true }),
   });
   const me = await client.me();
   return identityOf(me);
@@ -421,7 +438,11 @@ async function route(req, res, url) {
     const body = await readBody(req);
     const apiKey = String(body.apiKey || '').trim();
     if (!apiKey) throw new InstaboxError('缺少 API Key', { code: 'missing_key', status: 400 });
-    const identity = await testCredentials(apiKey, body.gatewayUrl ? store.normalizeBaseUrl(body.gatewayUrl) : '');
+    const identity = await testCredentials(
+      apiKey,
+      body.gatewayUrl ? store.normalizeBaseUrl(body.gatewayUrl) : '',
+      body.alias ? String(body.alias) : '',
+    );
     return send(res, 200, { ok: true, identity });
   }
 
@@ -442,8 +463,9 @@ async function route(req, res, url) {
       let identity = null;
       if (!body.skipTest) {
         try {
-          identity = await testCredentials(apiKey, gatewayUrl);
+          identity = await testCredentials(apiKey, gatewayUrl, alias);
         } catch (error) {
+          if (error && error.code === 'ERR_PROXY_REQUIRED_FAIL_CLOSED') throw error;
           throw new InstaboxError(`API Key 验证失败：${error.message}`, {
             code: 'test_failed',
             status: 400,
@@ -486,11 +508,12 @@ async function route(req, res, url) {
       if (body.enabled !== undefined) account.enabled = Boolean(body.enabled);
       if (body.retest) {
         try {
-          account.identity = await testCredentials(account.apiKey, account.gatewayUrl);
+          account.identity = await testCredentials(account.apiKey, account.gatewayUrl, account.alias);
           account.lastCheckedAt = new Date().toISOString();
           account.lastError = null;
         } catch (error) {
           account.lastError = error.message;
+          if (error && error.code === 'ERR_PROXY_REQUIRED_FAIL_CLOSED') throw error;
           throw new InstaboxError(`验证失败：${error.message}`, { code: 'test_failed', status: 400 });
         }
       }
@@ -735,7 +758,14 @@ async function route(req, res, url) {
     const alias = decodeURIComponent(parts[2]);
     const machineId = decodeURIComponent(parts[3]);
     const client = clientFor(state, alias);
-    const session = await terminals.create({ baseUrl: client.baseUrl, apiKey: client.apiKey, machineId });
+    const session = await terminals.create({
+      baseUrl: client.baseUrl,
+      apiKey: client.apiKey,
+      machineId,
+      connect: proxyRequired(state)
+        ? (wsUrl, wsOptions) => proxies.connectWebSocket(alias, wsUrl, wsOptions)
+        : undefined,
+    });
     return send(res, 201, {
       ok: true,
       sessionId: session.id,

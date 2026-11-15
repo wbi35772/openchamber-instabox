@@ -3128,6 +3128,8 @@
 
   async function testAccountForm(button) {
     var alias = (button.dataset.alias || state.modal && state.modal.alias || '').trim();
+    var aliasInput = $('#account-alias');
+    var candidate = (aliasInput ? aliasInput.value.trim() : '') || alias;
     var keyInput = $('#account-key');
     var gatewayInput = $('#account-gateway');
     var status = $('#account-status');
@@ -3142,7 +3144,7 @@
       } else {
         if (!apiKey) throw new Error('先输入 API Key');
         await service('POST', '/api/test', {
-          body: { apiKey: apiKey, gatewayUrl: gatewayInput ? gatewayInput.value.trim() : '' },
+          body: { apiKey: apiKey, gatewayUrl: gatewayInput ? gatewayInput.value.trim() : '', alias: candidate },
           timeoutMs: 30000,
         });
       }

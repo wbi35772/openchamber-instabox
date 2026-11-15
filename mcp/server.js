@@ -88,8 +88,9 @@ function client(account, state) {
     throw new InstaboxError('还没有配置可用的 Instabox 账号', { code: 'account_not_found', status: 404 });
   }
   rateLimiter.configure(account.alias, store.normalizeRateLimit(state.settings && state.settings.rateLimit));
+  const proxyEnabled = Boolean(state.settings && state.settings.proxy && state.settings.proxy.enabled === true);
   return InstaboxClient.fromAccount(account, state.settings, {
-    fetchImpl: proxies.fetchFor(account.alias),
+    fetchImpl: proxyEnabled ? proxies.requireFetchFor(account.alias) : undefined,
     rateLimiter,
     rateKey: account.alias,
   });
@@ -122,12 +123,30 @@ const recycler = createRecycler({
   directClientFor: (alias) => {
     const state = store.load();
     const account = store.findAccount(state, alias);
-    return account ? InstaboxClient.fromAccount(account, state.settings, {}) : null;
+    if (!account) return null;
+    try {
+      return client(account, state);
+    } catch (error) {
+      if (error && error.code === 'ERR_PROXY_REQUIRED_FAIL_CLOSED') {
+        log(`blocked direct recycle call for ${alias}: ${error.message}`);
+        return null;
+      }
+      throw error;
+    }
   },
   proxyClientFor: (alias) => {
     const state = store.load();
     const account = store.findAccount(state, alias);
-    return account ? client(account, state) : null;
+    if (!account) return null;
+    try {
+      return client(account, state);
+    } catch (error) {
+      if (error && error.code === 'ERR_PROXY_REQUIRED_FAIL_CLOSED') {
+        log(`blocked proxied recycle call for ${alias}: ${error.message}`);
+        return null;
+      }
+      throw error;
+    }
   },
   lockPath: path.join(store.DATA_DIR, 'recycle.lock'),
   log,

@@ -31,3 +31,19 @@ test('busy machines are skipped by the keepalive tick', async () => {
   await keepalive.tick(Date.now() + 1);
   assert.equal(fetches, 1);
 });
+
+test('keepalive release routes through the injected proxy-aware client', async () => {
+  store.save({
+    ...store.load(),
+    accounts: [{ alias: 'wbi', apiKey: 'ibk_test', enabled: true }],
+    keepalive: [{ account: 'wbi', machineId: 'm_rel', enabled: true, leaseId: 'oc-9' }],
+  });
+  let deleted = null;
+  const keepalive = createKeepalive({
+    clientFor: (alias) => ({
+      async deleteLease(machineId, leaseId) { deleted = `${alias}/${machineId}/${leaseId}`; },
+    }),
+  });
+  assert.equal(await keepalive.release('wbi', 'm_rel'), true);
+  assert.equal(deleted, 'wbi/m_rel/oc-9');
+});

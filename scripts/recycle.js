@@ -66,20 +66,27 @@ function main() {
 
   const proxies = createAccountProxy({ getState: () => store.load(), log });
 
+  function proxyRequired(state) {
+    return Boolean(state.settings && state.settings.proxy && state.settings.proxy.enabled === true);
+  }
+
   function clientFor(alias) {
     const current = store.load();
     const account = store.findAccount(current, alias);
     if (!account) return null;
-    return InstaboxClient.fromAccount(account, current.settings, {});
+    try {
+      const fetchImpl = proxyRequired(current) ? proxies.requireFetchFor(alias) : undefined;
+      return InstaboxClient.fromAccount(account, current.settings, { fetchImpl });
+    } catch (error) {
+      if (error && error.code === 'ERR_PROXY_REQUIRED_FAIL_CLOSED') {
+        log(`blocked direct recycle call for ${alias}: ${error.message}`);
+        return null;
+      }
+      throw error;
+    }
   }
 
-  function proxiedClientFor(alias) {
-    const current = store.load();
-    const account = store.findAccount(current, alias);
-    if (!account) return null;
-    const fetchImpl = proxies.fetchFor(alias);
-    return InstaboxClient.fromAccount(account, current.settings, { fetchImpl });
-  }
+  const proxiedClientFor = clientFor;
 
   async function saveStatus(patch) {
     await store.update((draft) => {
