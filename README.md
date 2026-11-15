@@ -1,3 +1,5 @@
+> **已归档**：本仓库已迁移到私有仓库 [`wbi35772/openchamber-instabox`](https://github.com/wbi35772/openchamber-instabox)，此处仅保留历史。新版本、问题与更新请使用新仓库；新仓库需要相应访问权限。
+
 # Instabox Matrix
 
 OpenChamber 扩展：在一个面板里管理多个 Instabox 账号的沙盒机器，并通过本地服务代理和 MCP 工具把这些能力交给 Agent。API Key 只保存在本地服务状态文件中，永远不会进入面板页面或浏览器存储。

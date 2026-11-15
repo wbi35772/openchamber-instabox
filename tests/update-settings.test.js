@@ -46,8 +46,8 @@ test('update proxy rejects junk and whitespace', () => {
 
 test('update repo accepts owner/name and https, rejects others', () => {
   assert.equal(
-    normalizeUpdateSettings({ repo: 'wbi35772/openchamber-instabox-matrix' }).repo,
-    'https://github.com/wbi35772/openchamber-instabox-matrix.git',
+    normalizeUpdateSettings({ repo: 'wbi35772/openchamber-instabox' }).repo,
+    'https://github.com/wbi35772/openchamber-instabox.git',
   );
   assert.equal(
     normalizeUpdateSettings({ repo: 'https://git.example.com/x/y.git' }).repo,
