@@ -246,7 +246,7 @@ state.recycle = [{
 
 ### 9.3 重复触发
 
-- 同一 `runStartedAt` 只成功回收一次；失败重试与成功分别记录 `lastAttemptRunStartedAt` / `lastRunStartedAt`。
+- 同一 `runStartedAt` 在同一周期内只成功回收一次；护栏 `max(5min, (maxRun−lead)/2)`，越过半个周期后到点可再次回收（a00198e）。失败重试与成功分别记录 `lastAttemptRunStartedAt` / `lastRunStartedAt`。
 - 成功后 `nextAt` 基于新 `runStartedAt`；失败后 5 分钟内不再尝试。
 
 ### 9.4 keepalive 抑制
