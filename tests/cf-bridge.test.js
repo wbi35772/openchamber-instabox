@@ -50,6 +50,7 @@ test('normalizeProvisionBody derives the egress port and defaults the routing pl
     hostname: 'demo.example.com',
   });
   assert.deepEqual(body, {
+    vmInstanceId: 'm-1',
     machineId: 'm-1',
     matrixSlotId: 'slot-012',
     egressPort: 24012,
@@ -67,6 +68,26 @@ test('normalizeProvisionBody derives the egress port and defaults the routing pl
   assert.throws(
     () => normalizeProvisionBody({ matrixSlotId: 'slot-012', machineId: 'm-1' }),
     (error) => error.code === 'missing_hostname',
+  );
+});
+
+test('normalizeProvisionBody forwards a validated internal service port', () => {
+  const body = normalizeProvisionBody({
+    matrixSlotId: 'slot-020',
+    vmInstanceId: 'm-20',
+    publicHostname: 'demo20.example.com',
+    internalPort: 3000,
+  });
+  assert.equal(body.internalPort, 3000);
+  assert.equal(body.vmInstanceId, 'm-20');
+  assert.equal(body.egressPort, 24020);
+  assert.equal(
+    normalizeProvisionBody({ matrixSlotId: 'slot-020', machineId: 'm-20', hostname: 'h', servicePort: '8080' }).internalPort,
+    8080,
+  );
+  assert.throws(
+    () => normalizeProvisionBody({ matrixSlotId: 'slot-020', machineId: 'm-20', hostname: 'h', internalPort: 70000 }),
+    (error) => error.code === 'invalid_internal_port',
   );
 });
 
@@ -95,6 +116,7 @@ test('provisionMachine starts cloudflared without leaking the tunnel token', asy
   assert.ok(execs[0].cmd.includes("--token 'SECRET-TOKEN'"), execs[0].cmd);
   assert.equal(JSON.stringify(outcome).includes('SECRET-TOKEN'), false);
   assert.deepEqual(bridge.calls[0].body, {
+    vmInstanceId: 'm-1',
     machineId: 'm-1',
     matrixSlotId: 'slot-012',
     egressPort: 24012,
@@ -155,7 +177,11 @@ test('teardownMachine kills cloudflared and releases the tunnel', async () => {
   assert.equal(execs.length, 1);
   assert.match(execs[0].cmd, /pkill -f "cloudflared tunnel run"/);
   assert.equal(execs[0].options.noHistory, true);
-  assert.deepEqual(bridge.calls[0].body, { machineId: 'm-4', matrixSlotId: 'slot-004' });
+  assert.deepEqual(bridge.calls[0].body, {
+    vmInstanceId: 'm-4',
+    machineId: 'm-4',
+    matrixSlotId: 'slot-004',
+  });
 });
 
 test('status falls back to /health when the bridge has no status route', async () => {

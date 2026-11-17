@@ -272,6 +272,13 @@ function tunnelHostname(state, alias, machineId) {
   return label ? `${label}.${suffix}` : '';
 }
 
+function tunnelInternalPort(state, machineId) {
+  const tunnels = (state.settings && state.settings.proxy && state.settings.proxy.tunnels) || {};
+  const explicit = tunnels[machineId];
+  const port = Number(explicit && explicit.internalPort);
+  return Number.isInteger(port) && port > 0 && port <= 65535 ? port : 0;
+}
+
 async function autoProvisionTunnel(alias, machineId) {
   const state = store.load();
   const account = store.findAccount(state, alias);
@@ -286,6 +293,7 @@ async function autoProvisionTunnel(alias, machineId) {
   const outcome = await cfBridge.provisionMachine(client, machineId, {
     matrixSlotId: target.matrixSlotId,
     hostname,
+    internalPort: tunnelInternalPort(state, machineId),
     account: alias,
     routingPlane: target.routingPlane,
   });

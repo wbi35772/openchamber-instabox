@@ -8,7 +8,7 @@ const contract = require('../core/contract');
 
 const REFERENCE = path.resolve(
   __dirname, '..', '..', '..',
-  'egress matrix', 'openchamber-egress-matrix', 'core', 'contract.js',
+  'openchamber-egress-matrix', 'core', 'contract.js',
 );
 
 test('slot ids and egress ports form one 250-slot matrix', () => {

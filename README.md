@@ -116,7 +116,7 @@ MCP 直接读取状态文件并访问 Instabox API，不依赖面板或本地 HT
 | `instabox_desktop` | status / install / start / takeover / handback / stream / stream_state / stream_revoke |
 | `instabox_recycle` | status / set / run |
 | `instabox_matrix_slot_status` | 查询 egress 槽位、租约与冻结状态（可触发探测） |
-| `instabox_provision_cf_tunnel` | 为运行中实例 provision Cloudflare Tunnel 并拉起 cloudflared |
+| `instabox_provision_cf_tunnel` | 为运行中实例 provision Cloudflare Tunnel 并拉起 cloudflared；`internal_port` 指定沙箱内转发端口 |
 
 ## 面板
 
@@ -129,7 +129,7 @@ MCP 直接读取状态文件并访问 Instabox API，不依赖面板或本地 HT
 ## 开发
 
 ```powershell
-npm test                      # 252 条测试
+npm test                      # 253 条测试
 node scripts/sync.mjs --check # 安装副本对齐
 node scripts/docs-canvas.js   # 重新发布全景文档
 ```
@@ -141,7 +141,7 @@ service/   本地 HTTP 服务（127.0.0.1）
 panel/     面板（IIFE + xterm vendor）
 mcp/       MCP stdio 服务（19 个工具）
 scripts/   sync / singbox / sub2port / recycle / keepalive / docs-canvas
-tests/     node:test（40 个文件，252 条）
+tests/     node:test（40 个文件，253 条）
 docs/      analysis / reports / canvas / plans / specs
 ```
 

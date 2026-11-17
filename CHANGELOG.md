@@ -1,5 +1,15 @@
 # 变更记录
 
+## 1.7.1 — 2026-11-17
+
+与 cloudflare 契约补齐：provision / teardown 载荷带 `vmInstanceId`，并支持沙箱内服务端口。
+
+- `lib/cf-bridge.js`：`normalizeProvisionBody` 输出 `vmInstanceId` + `machineId`，接受 `internalPort` / `servicePort` / `targetPort`（1-65535，非法抛 `invalid_internal_port`）；`teardown` 载荷同样带 `vmInstanceId`。
+- `service/main.js`：自动 provision 读取 `settings.proxy.tunnels[machineId].internalPort` 并转发。
+- `mcp/server.js`：`instabox_provision_cf_tunnel` 新增 `internal_port` 参数，持久化到隧道配置后透传。
+- `panel/style.css`：变量收敛为三方统一的 `--oc-*` 矩阵调色板（页面行为不变）。
+- 测试同步载荷断言并新增 internalPort 用例；合约对齐测试改为指向真实参考文件，253 条全部通过。
+
 ## 1.7.0 — 2026-11-16
 
 Egress Matrix T0：出口管理移交 `openchamber-egress-matrix`（127.0.0.1:19880），实例打通 `openchamber-cloudflare` Argo Tunnel（127.0.0.1:19882）。

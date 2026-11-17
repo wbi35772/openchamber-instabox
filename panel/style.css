@@ -1,23 +1,36 @@
 :root {
   color-scheme: dark;
-  --bg: #0d1117;
+  /* Shared OpenChamber matrix palette — must stay identical across
+     instabox-matrix, egress-matrix and cloudflare panels. */
+  --oc-bg-base: #0d1117;
+  --oc-bg-card: #161b22;
+  --oc-bg-elevated: #1f242c;
+  --oc-border: #30363d;
+  --oc-text-primary: #f0f6fc;
+  --oc-text-muted: #8b949e;
+  --oc-status-active: #10b981;
+  --oc-status-cooldown: #f59e0b;
+  --oc-status-quarantine: #ef4444;
+  --oc-status-warp: #8b5cf6;
+  --oc-accent: #3b82f6;
+  --bg: var(--oc-bg-base);
   --bg-soft: #0b0f14;
-  --panel: #161b22;
-  --panel-2: #1b2230;
+  --panel: var(--oc-bg-card);
+  --panel-2: var(--oc-bg-elevated);
   --panel-3: #212a3a;
-  --line: #263141;
+  --line: var(--oc-border);
   --line-soft: #1e2733;
-  --text: #e6edf3;
-  --muted: #8b949e;
+  --text: var(--oc-text-primary);
+  --muted: var(--oc-text-muted);
   --dim: #5b6675;
-  --green: #10b981;
+  --green: var(--oc-status-active);
   --green-soft: rgba(16, 185, 129, 0.12);
   --green-line: rgba(16, 185, 129, 0.35);
   --mint: #34d399;
-  --blue: #38bdf8;
-  --amber: #f59e0b;
-  --red: #ef4444;
-  --purple: #a78bfa;
+  --blue: var(--oc-accent);
+  --amber: var(--oc-status-cooldown);
+  --red: var(--oc-status-quarantine);
+  --purple: var(--oc-status-warp);
   --radius: 14px;
   --mono: ui-monospace, "SFMono-Regular", "Cascadia Code", "JetBrains Mono", Consolas, monospace;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", "PingFang SC", "Microsoft YaHei", sans-serif;

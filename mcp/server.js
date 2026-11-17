@@ -414,6 +414,7 @@ const TOOLS = [
         account: { type: 'string', description: 'Account alias; default the active account.' },
         machine_id: { type: 'string', description: 'Sandbox ID or name.' },
         hostname: { type: 'string', description: 'Public hostname; default from settings.proxy.tunnels or <alias>-<id>.<hostnameSuffix>.' },
+        internal_port: { type: 'number', description: 'Sandbox service port the tunnel forwards to, e.g. 3000.' },
       },
       required: ['operation'],
       additionalProperties: false,
@@ -1588,9 +1589,11 @@ async function cfTunnelTool(args) {
   if (!hostname) {
     return fail('缺少 hostname：请在参数中给出，或配置 settings.cf.hostnameSuffix / OPENCHAMBER_CF_HOSTNAME_SUFFIX');
   }
+  const internalPort = Number(args.internal_port || args.internalPort || 0);
+  const port = Number.isInteger(internalPort) && internalPort > 0 && internalPort <= 65535 ? internalPort : 0;
   await store.update((draft) => {
     draft.settings.proxy = store.normalizeProxySettings(draft.settings.proxy);
-    draft.settings.proxy.tunnels[machineId] = { hostname };
+    draft.settings.proxy.tunnels[machineId] = { hostname, ...(port ? { internalPort: port } : {}) };
     return true;
   });
   const outcome = await cfBridge.provisionMachine(api, machineId, {
@@ -1598,6 +1601,7 @@ async function cfTunnelTool(args) {
     hostname,
     account: account.alias,
     routingPlane: target.routingPlane,
+    ...(port ? { internalPort: port } : {}),
   });
   return ok(JSON.stringify({ ok: true, account: account.alias, ...outcome }, null, 2));
 }
