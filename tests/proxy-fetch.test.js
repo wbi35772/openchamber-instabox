@@ -111,3 +111,57 @@ test('aborting an in-flight request rejects with AbortError', async () => {
     await close(proxy);
   }
 });
+
+test('suspend parks in-flight calls until resume releases them', async () => {
+  const proxy = http.createServer((req, res) => res.end('after-rotation'));
+  const port = await listen(proxy);
+  const client = createProxyFetch(port, { resumeBarrierMs: 2000 });
+  try {
+    client.suspend();
+    assert.equal(client.isSuspended(), true);
+    const pending = client.fetch('http://target.example/frozen');
+    const parked = await client.waitForResume(50);
+    assert.deepEqual(parked, { ok: false, timeout: true });
+    client.resume();
+    assert.equal(client.isSuspended(), false);
+    const response = await pending;
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), 'after-rotation');
+  } finally {
+    client.resume();
+    await client.close();
+    await close(proxy);
+  }
+});
+
+test('a suspended client rejects with PROXY_SUSPENDED after the barrier', async () => {
+  const client = createProxyFetch(1, { resumeBarrierMs: 20 });
+  try {
+    client.suspend();
+    await assert.rejects(
+      () => client.fetch('http://target.example/'),
+      (error) => error.code === 'PROXY_SUSPENDED',
+    );
+  } finally {
+    client.resume();
+    await client.close();
+  }
+});
+
+test('waitForResume resolves immediately when the client is not suspended', async () => {
+  const client = createProxyFetch(1);
+  try {
+    assert.deepEqual(await client.waitForResume(10), { ok: true, already: true });
+  } finally {
+    await client.close();
+  }
+});
+
+test('close releases parked waiters so the rotation barrier cannot hang', async () => {
+  const client = createProxyFetch(1, { resumeBarrierMs: 5000 });
+  client.suspend();
+  const pending = client.fetch('http://target.example/');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await client.close();
+  await assert.rejects(pending, (error) => error.code === 'PROXY_SUSPENDED');
+});

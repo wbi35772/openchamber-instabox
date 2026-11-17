@@ -364,3 +364,49 @@ test('autoWake retries a failed wake at most once a minute', async () => {
   await tickEntries([merged], { now: () => T0 + 61000, clientFor: () => client });
   assert.equal(powerCalls, 2);
 });
+
+test('tickEntries defers the heartbeat while the egress slot is frozen', async () => {
+  const entry = makeEntry({ expiresAt: null, leaseId: '' });
+  const patches = await tickEntries([entry], {
+    now: () => T0,
+    clientFor: () => { throw new Error('frozen heartbeat must not touch the client'); },
+    waitForResume: async () => ({ ok: false, timeout: true }),
+  });
+  assert.equal(patches.length, 1);
+  assert.equal(patches[0].patch.deferred, true);
+  assert.equal(patches[0].patch.lastOk, null);
+  assert.match(patches[0].patch.lastError, /换血冻结/);
+  assert.equal(patches[0].patch.lastRunAt, iso(T0));
+});
+
+test('tickEntries continues normally once the barrier resolves', async () => {
+  let leaseCalls = 0;
+  const client = fakeClient(
+    () => {
+      leaseCalls += 1;
+      return { expiresAt: iso(T0 + 900000) };
+    },
+    () => {},
+  );
+  const patches = await tickEntries([makeEntry({ expiresAt: null })], {
+    now: () => T0,
+    clientFor: () => client,
+    waitForResume: async () => ({ ok: true, resumed: true }),
+  });
+  assert.equal(leaseCalls, 1);
+  assert.equal(patches[0].patch.deferred, undefined);
+  assert.equal(patches[0].patch.lastOk, true);
+});
+
+test('tickEntries turns a barrier rejection into a deferred patch instead of failing the tick', async () => {
+  const error = Object.assign(new Error('proxy suspended'), { code: 'PROXY_SUSPENDED' });
+  const patches = await tickEntries([makeEntry({ expiresAt: null })], {
+    now: () => T0,
+    clientFor: () => { throw new Error('unreachable'); },
+    waitForResume: async () => { throw error; },
+  });
+  assert.equal(patches.length, 1);
+  assert.equal(patches[0].patch.deferred, true);
+  assert.equal(patches[0].patch.lastOk, null);
+  assert.match(patches[0].patch.lastError, /顺延/);
+});

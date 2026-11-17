@@ -415,6 +415,7 @@ const TOOLS = [
         machine_id: { type: 'string', description: 'Sandbox ID or name.' },
         hostname: { type: 'string', description: 'Public hostname; default from settings.proxy.tunnels or <alias>-<id>.<hostnameSuffix>.' },
         internal_port: { type: 'number', description: 'Sandbox service port the tunnel forwards to, e.g. 3000.' },
+        tunnel_id: { type: 'string', description: 'Tunnel ID for teardown; defaults to the ID remembered from provision.' },
       },
       required: ['operation'],
       additionalProperties: false,
@@ -1494,6 +1495,15 @@ function tunnelHostnameFor(state, alias, machineId, explicit) {
   return `${alias}-${machineId}.${suffix}`.toLowerCase();
 }
 
+function tunnelDomainZoneFor(state, hostname) {
+  const cf = (state.settings && state.settings.cf) || {};
+  const configured = String(cf.domainZone || process.env.OPENCHAMBER_CF_DOMAIN_ZONE || '')
+    .trim().toLowerCase().replace(/^\.+/, '').replace(/\.+$/, '');
+  if (configured) return configured;
+  const parts = String(hostname || '').split('.').filter(Boolean);
+  return parts.length > 1 ? parts.slice(1).join('.').toLowerCase() : '';
+}
+
 function matrixSlotStatusTool(args) {
   const state = store.load();
   const alias = String(args.account || '').trim();
@@ -1571,9 +1581,14 @@ async function cfTunnelTool(args) {
   if (operation === 'teardown') {
     let target = null;
     try { target = proxies.slotFor(account.alias); } catch { target = null; }
+    const configured = state.settings
+      && state.settings.proxy
+      && state.settings.proxy.tunnels
+      && state.settings.proxy.tunnels[machineId];
     const outcome = await cfBridge.teardownMachine(api, machineId, {
       hostname: explicit,
       matrixSlotId: target && target.matrixSlotId ? target.matrixSlotId : '',
+      tunnelId: String(args.tunnel_id || args.tunnelId || (configured && configured.tunnelId) || ''),
     });
     return ok(JSON.stringify({ ok: true, account: account.alias, ...outcome }, null, 2));
   }
@@ -1603,6 +1618,14 @@ async function cfTunnelTool(args) {
     routingPlane: target.routingPlane,
     ...(port ? { internalPort: port } : {}),
   });
+  if (outcome && outcome.tunnelId) {
+    await store.update((draft) => {
+      draft.settings.proxy = store.normalizeProxySettings(draft.settings.proxy);
+      const record = draft.settings.proxy.tunnels[machineId] || { hostname };
+      draft.settings.proxy.tunnels[machineId] = { ...record, tunnelId: outcome.tunnelId };
+      return true;
+    });
+  }
   return ok(JSON.stringify({ ok: true, account: account.alias, ...outcome }, null, 2));
 }
 

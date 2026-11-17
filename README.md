@@ -1,6 +1,6 @@
 # OpenChamber Instabox
 
-> 私有仓库：`wbi35772/openchamber-instabox` · 扩展 ID：`instabox-matrix` · v1.7.0
+> 私有仓库：`wbi35772/openchamber-instabox` · 扩展 ID：`instabox-matrix` · v1.8.0
 >
 > 仓库名是 `openchamber-instabox`；为保持已安装扩展、状态目录和 MCP 配置兼容，扩展 ID 与 `~/.openchamber-instabox-matrix` 数据目录保持不变。
 >
@@ -12,8 +12,9 @@ OpenChamber 的多账号 Instabox 机器矩阵扩展：一个面板管理多个�
 
 - **零直连出口**：REST、凭证测试、回收控制面、keepalive 租约与终端 WebSocket 全部绑定 per-alias 代理；无端口抛 `ERR_PROXY_REQUIRED_FAIL_CLOSED`（503），不回退 `globalThis.fetch`。
 - **Egress Matrix 委托**：出口槽位、租约与换血交给 `openchamber-egress-matrix`（127.0.0.1:19880）。账号固定 `matrixSlotId` + `egressPort`（24001–24250），控制面注入双平面头；发包前核验槽位，`QUARANTINED` / `WARP_OVERFLOW` / `ROTATING` 立即 fail-closed。
-- **换血冻结**：订阅 egress WS，`PRE_ROTATION_FREEZE` 暂停该槽 keepalive/jobs 并销毁连接池、回 `ack-freeze`；`POST_ROTATION_RESUME` 刷新指纹后恢复。
-- **Cloudflare Tunnel**：实例 RUNNING 后经 `openchamber-cloudflare`（127.0.0.1:19882）provision 隧道，并在实例内拉起 `cloudflared tunnel run`；销毁时 teardown。token 只经一次 `noHistory` exec 注入，不落状态与日志。
+- **换血冻结**：订阅 egress WS，`PRE_ROTATION_FREEZE` 暂停该槽 keepalive/jobs 并销毁连接池、回 `ack-freeze`；`POST_ROTATION_RESUME` 刷新指纹后恢复，恢复阶段对在途请求加最多 1500ms 屏障，避免冻结窗口穿透。
+- **Cloudflare Tunnel**：实例 RUNNING 后经 `openchamber-cloudflare`（127.0.0.1:19882）provision 隧道，并在实例内拉起 `cloudflared tunnel run`；销毁时 teardown。token 只经一次 `noHistory` exec 注入，不落状态与日志。`COOLDOWN` 不再让开机失败，改投后台退避重试；实例内 `cloudflared` 掉线时心跳用缓存 token 自动重拉。
+- **服务互通**：本服务开启 CORS 并提供公开 `GET /api/v1/instabox/bus-health`（运行实例 / 活动租约 / 已隧道实例），供面板与 CF / Egress 面板顶栏实时探测。
 - **多账号矩阵**：每账号一行，按 alias 路由；机器卡片展示状态、规格、数据盘、uptime、最长运行与冷却时间，以及槽位/端口、exitIp+/64、publicHostname。
 - **机器操作**：启动、停止、暂停、恢复、重启、删除（名称确认）、从模板创建与克隆（等待 operation）。
 - **活动租约**：自动续租；空闲暂停后由 exec / 终端流量唤醒；可选冷却唤醒 `wake → resume → start`。
@@ -122,16 +123,18 @@ MCP 直接读取状态文件并访问 Instabox API，不依赖面板或本地 HT
 
 机器详情 9 个 tab：概览、服务、访问、文件、终端、指标、日志、历史、进程。切换或关闭会停止轮询并清理终端会话与浏览器会话。
 
-顶栏显示 `OC // INSTABOX-MATRIX`、EGRESS 与 CLOUDFLARE 状态灯、实例计数，以及批量保活 / 回收 / 同步 Egress 按钮。卡片额外显示槽位与端口、exitIp + /64、publicHostname 和双轨（控制面 / 数据面）进度条。
+顶栏显示 `OC // INSTABOX-MATRIX`、EGRESS 与 CLOUDFLARE 状态灯、实例计数，以及批量保活 / 回收 / 同步 Egress 按钮。状态灯实时探测 19880 / 19882 与本服务 bus-health，CF 冷却时显示 `COOLDOWN n`。卡片额外显示槽位与端口、exitIp + /64、publicHostname 和双轨（控制面 / 数据面）进度条；点击 `publicHostname` 直接呼出底部 xterm 终端抽屉。
 
 机器 Canvas 会把状态、SSH、公网入口、应用清单（含账号密码）、监听端口、容器、systemd、保活与回收信息发布为 artifact；同一机器复用 artifact 并追加版本，密码默认掩码。Canvas 访客页运行在沙箱中，链接改为画布内导航；目标站点返回 `X-Frame-Options: DENY` 时需复制到浏览器打开。
 
 ## 开发
 
 ```powershell
-npm test                      # 253 条测试
+npm test                      # 280 条测试
 node scripts/sync.mjs --check # 安装副本对齐
 node scripts/docs-canvas.js   # 重新发布全景文档
+node scripts/verify-trinity-matrix.mjs --slots slot-002,slot-004  # 三仓四阶段验收
+node scripts/probe-cf-provision.mjs                               # CF provision 契约（stub 上游）
 ```
 
 ```text
@@ -140,8 +143,8 @@ core/      统一合约 contract.js（与 egress / cloudflare 对齐）
 service/   本地 HTTP 服务（127.0.0.1）
 panel/     面板（IIFE + xterm vendor）
 mcp/       MCP stdio 服务（19 个工具）
-scripts/   sync / singbox / sub2port / recycle / keepalive / docs-canvas
-tests/     node:test（40 个文件，253 条）
+scripts/   sync / singbox / sub2port / recycle / keepalive / verify-trinity / probe-cf / docs-canvas
+tests/     node:test（41 个文件，280 条）
 docs/      analysis / reports / canvas / plans / specs
 ```
 

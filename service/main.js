@@ -52,6 +52,7 @@ const cfBridge = createCfBridge({
 const proxies = createAccountProxy({ getState: () => store.load(), log, egress });
 const leaseSync = createEgressLeaseSync({ egress, getState: () => store.load(), log });
 const cfTunnels = new Map();
+const cfTunnelJobs = new Map();
 const rateLimiter = createRateLimiter();
 const jobs = createJobs({
   gate: async (job) => {
@@ -90,6 +91,8 @@ const keepalive = createKeepalive({
   rateLimiter,
   clientFor: (alias) => clientForAccount(store.findAccount(store.load(), alias), store.load()),
   isBusy: (account, machineId) => recycler.isBusy(account, machineId) || proxies.isPaused(account),
+  waitForResume: (alias) => proxies.waitForResume(alias, { timeoutMs: 1500 }),
+  tunnel: { check: tunnelCheckHeartbeat, restart: tunnelRestartHeartbeat },
 });
 const netprobe = createNetProbe();
 const terminals = createTerminalManager({ log });
@@ -279,7 +282,87 @@ function tunnelInternalPort(state, machineId) {
   return Number.isInteger(port) && port > 0 && port <= 65535 ? port : 0;
 }
 
-async function autoProvisionTunnel(alias, machineId) {
+function tunnelDomainZone(state, hostname) {
+  const configured = String(
+    (state.settings && state.settings.cf && state.settings.cf.domainZone)
+    || process.env.OPENCHAMBER_CF_DOMAIN_ZONE
+    || '',
+  ).trim().toLowerCase().replace(/^\.+/, '').replace(/\.+$/, '');
+  if (configured) return configured;
+  const parts = String(hostname || '').split('.').filter(Boolean);
+  return parts.length > 1 ? parts.slice(1).join('.').toLowerCase() : '';
+}
+
+function tunnelKey(alias, machineId) {
+  return `${alias}/${machineId}`;
+}
+
+function pendingTunnelJob(alias, machineId) {
+  const key = tunnelKey(alias, machineId);
+  const jobId = cfTunnelJobs.get(key);
+  if (!jobId) return null;
+  const job = jobs.get(jobId);
+  if (job && (job.status === 'pending' || job.status === 'running')) return job;
+  cfTunnelJobs.delete(key);
+  return null;
+}
+
+function recordCfTunnel(alias, machineId, fields) {
+  const key = tunnelKey(alias, machineId);
+  const previous = cfTunnels.get(key) || {};
+  const record = { ...previous, machineId, at: Date.now(), ...fields };
+  cfTunnels.set(key, record);
+  return record;
+}
+
+function cancelTunnelRetry(alias, machineId) {
+  const key = tunnelKey(alias, machineId);
+  const jobId = cfTunnelJobs.get(key);
+  if (!jobId) return null;
+  const job = jobs.cancel(jobId);
+  cfTunnelJobs.delete(key);
+  return job;
+}
+
+/*
+ * Cloudflare account cooldown must never fail an instance boot. The tunnel
+ * injection is parked in the job queue and retried with exponential backoff;
+ * the sandbox stays RUNNING and the tunnel is attached once the backoff ends.
+ */
+function scheduleTunnelRetry(alias, machineId, error, state) {
+  const existing = pendingTunnelJob(alias, machineId);
+  if (existing) return existing;
+  const retry = (state && state.settings && state.settings.cf && state.settings.cf.retry) || {};
+  const job = jobs.retry(async () => {
+    const outcome = await autoProvisionTunnel(alias, machineId, { queue: false });
+    if (!outcome || outcome.ok === false) {
+      throw new InstaboxError(
+        (outcome && outcome.error) || 'CF 隧道仍未就绪',
+        { code: 'cf_tunnel_pending', status: 503 },
+      );
+    }
+    cfTunnelJobs.delete(tunnelKey(alias, machineId));
+    return outcome;
+  }, { kind: 'cf-tunnel', alias, machineId }, {
+    attempts: retry.attempts === undefined ? 6 : Number(retry.attempts),
+    delayMs: retry.delayMs === undefined ? 15000 : Number(retry.delayMs),
+    factor: retry.factor === undefined ? 2 : Number(retry.factor),
+    maxDelayMs: retry.maxDelayMs === undefined ? 5 * 60 * 1000 : Number(retry.maxDelayMs),
+  });
+  cfTunnelJobs.set(tunnelKey(alias, machineId), job.id);
+  recordCfTunnel(alias, machineId, {
+    ok: false,
+    queued: true,
+    retryJobId: job.id,
+    nextAt: job.nextAt,
+    error: error ? error.message : '',
+    code: error && error.code ? error.code : 'cf_retry',
+  });
+  log(`CF 隧道进入退避重试 ${alias}/${machineId}（${error ? error.message : 'unknown'}）`);
+  return job;
+}
+
+async function autoProvisionTunnel(alias, machineId, provisionOptions = {}) {
   const state = store.load();
   const account = store.findAccount(state, alias);
   if (!account) return null;
@@ -290,23 +373,117 @@ async function autoProvisionTunnel(alias, machineId) {
   if (!hostname) return null;
   const client = controlClientFor(alias);
   if (!client) return { ok: false, alias, machineId, error: 'proxy_unavailable' };
-  const outcome = await cfBridge.provisionMachine(client, machineId, {
-    matrixSlotId: target.matrixSlotId,
-    hostname,
-    internalPort: tunnelInternalPort(state, machineId),
-    account: alias,
-    routingPlane: target.routingPlane,
-  });
-  cfTunnels.set(`${alias}/${machineId}`, {
-    ok: outcome.ok !== false,
-    machineId,
-    matrixSlotId: outcome.matrixSlotId || target.matrixSlotId,
-    hostname: outcome.hostname || hostname,
-    tunnelId: outcome.tunnelId || '',
-    cloudflared: outcome.cloudflared || 'unknown',
-    at: Date.now(),
-  });
-  return outcome;
+  try {
+    const outcome = await cfBridge.provisionMachine(client, machineId, {
+      matrixSlotId: target.matrixSlotId,
+      hostname,
+      internalPort: tunnelInternalPort(state, machineId),
+      domainZone: tunnelDomainZone(state, hostname),
+      account: alias,
+      routingPlane: target.routingPlane,
+    });
+    recordCfTunnel(alias, machineId, {
+      ok: outcome.ok !== false,
+      matrixSlotId: outcome.matrixSlotId || target.matrixSlotId,
+      hostname: outcome.hostname || hostname,
+      tunnelId: outcome.tunnelId || '',
+      cloudflared: outcome.cloudflared || 'unknown',
+      queued: false,
+      error: '',
+    });
+    if (outcome.tunnelId) {
+      const configured = ((state.settings.proxy || {}).tunnels || {})[machineId] || {};
+      if (configured.tunnelId !== outcome.tunnelId) {
+        await store.update((draft) => {
+          draft.settings.proxy = store.normalizeProxySettings(draft.settings.proxy);
+          const record = draft.settings.proxy.tunnels[machineId] || { hostname };
+          draft.settings.proxy.tunnels[machineId] = { ...record, tunnelId: outcome.tunnelId };
+          return true;
+        });
+      }
+    }
+    return outcome;
+  } catch (error) {
+    if (provisionOptions.queue !== false && cfBridge.isRetryableError(error)) {
+      const job = scheduleTunnelRetry(alias, machineId, error, state);
+      return {
+        ok: false,
+        queued: true,
+        alias,
+        machineId,
+        jobId: job.id,
+        nextAt: job.nextAt,
+        code: error.code || 'cf_retry',
+        error: error.message,
+      };
+    }
+    throw error;
+  }
+}
+
+async function tunnelCheckHeartbeat(entry) {
+  const state = store.load();
+  if (!tunnelHostname(state, entry.account, entry.machineId)) return null;
+  const client = controlClientFor(entry.account);
+  if (!client) return { ok: false, error: 'proxy_unavailable' };
+  const probe = await cfBridge.checkCloudflared(client, entry.machineId);
+  if (!probe.running) {
+    log(`cloudflared 掉线 ${entry.account}/${entry.machineId}，触发自愈`);
+    return { ...probe, ok: false };
+  }
+  return { ...probe, ok: true };
+}
+
+async function tunnelRestartHeartbeat(entry) {
+  const state = store.load();
+  const hostname = tunnelHostname(state, entry.account, entry.machineId);
+  if (!hostname) return { ok: false, error: 'tunnel_not_configured' };
+  let target = null;
+  try { target = proxies.slotFor(entry.account); } catch { target = null; }
+  if (!target || !target.matrixSlotId) return { ok: false, error: 'matrix_slot_missing' };
+  const client = controlClientFor(entry.account);
+  if (!client) return { ok: false, error: 'proxy_unavailable' };
+  try {
+    const outcome = await cfBridge.restartCloudflared(client, entry.machineId, {
+      matrixSlotId: target.matrixSlotId,
+      hostname,
+      internalPort: tunnelInternalPort(state, entry.machineId),
+      domainZone: tunnelDomainZone(state, hostname),
+      account: entry.account,
+      routingPlane: target.routingPlane,
+    });
+    recordCfTunnel(entry.account, entry.machineId, {
+      ok: outcome.ok !== false,
+      matrixSlotId: outcome.matrixSlotId || target.matrixSlotId,
+      hostname: outcome.hostname || hostname,
+      tunnelId: outcome.tunnelId || '',
+      cloudflared: outcome.cloudflared || (outcome.restarted ? 'restarted' : 'unknown'),
+      queued: false,
+      error: outcome.error || '',
+    });
+    return outcome;
+  } catch (error) {
+    if (cfBridge.isRetryableError(error)) {
+      const job = scheduleTunnelRetry(entry.account, entry.machineId, error, state);
+      return { ok: false, queued: true, jobId: job.id, error: error.message };
+    }
+    throw error;
+  }
+}
+
+function instaboxBusHealth() {
+  let state = null;
+  try { state = store.load(); } catch { state = null; }
+  const entries = state && Array.isArray(state.keepalive) ? state.keepalive : [];
+  const runningMachines = entries.filter(
+    (entry) => entry && entry.enabled !== false && entry.lastOk === true,
+  ).length;
+  const activeLeases = entries.filter((entry) => entry && entry.leaseId).length;
+  let tunnelledMachines = 0;
+  for (const tunnel of cfTunnels.values()) {
+    if (tunnel && tunnel.ok !== false && !tunnel.queued) tunnelledMachines += 1;
+  }
+  return { ok: true, service: 'instabox-matrix', runningMachines, activeLeases, tunnelledMachines };
 }
 
 async function overview(state, requested) {
@@ -868,10 +1045,15 @@ async function route(req, res, url) {
     if (!client) throw new InstaboxError('该账号没有可用代理，已拒绝直连', { code: 'proxy_unavailable', status: 503 });
     let target = null;
     try { target = proxies.slotFor(alias); } catch { target = null; }
+    cancelTunnelRetry(alias, machineId);
+    const tunnelRecord = cfTunnels.get(tunnelKey(alias, machineId)) || {};
+    const persisted = ((store.load().settings.proxy || {}).tunnels || {})[machineId] || {};
     const outcome = await cfBridge.teardownMachine(client, machineId, {
       hostname: String(body.hostname || ''),
       matrixSlotId: target && target.matrixSlotId ? target.matrixSlotId : String(body.matrixSlotId || ''),
+      tunnelId: String(body.tunnelId || tunnelRecord.tunnelId || persisted.tunnelId || ''),
     });
+    cfBridge.forgetToken(machineId);
     cfTunnels.delete(`${alias}/${machineId}`);
     return send(res, 200, { ok: true, tunnel: outcome });
   }
@@ -1323,9 +1505,14 @@ async function route(req, res, url) {
         try {
           let target = null;
           try { target = proxies.slotFor(alias); } catch { target = null; }
+          cancelTunnelRetry(alias, machineId);
+          const tunnelRecord = cfTunnels.get(tunnelKey(alias, machineId)) || {};
+          const persisted = ((store.load().settings.proxy || {}).tunnels || {})[machineId] || {};
           await cfBridge.teardownMachine(client, machineId, {
             matrixSlotId: target && target.matrixSlotId ? target.matrixSlotId : '',
+            tunnelId: tunnelRecord.tunnelId || persisted.tunnelId || '',
           });
+          cfBridge.forgetToken(machineId);
         } catch (error) {
           log(`CF 隧道清理失败 ${alias}/${machineId}: ${error.message}`);
         }
@@ -1346,18 +1533,34 @@ async function route(req, res, url) {
   throw new InstaboxError('接口不存在', { code: 'not_found', status: 404 });
 }
 
+function applyCors(req, res) {
+  const origin = String(req.headers.origin || '');
+  res.setHeader('access-control-allow-origin', origin || '*');
+  res.setHeader('access-control-allow-methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+  res.setHeader(
+    'access-control-allow-headers',
+    String(req.headers['access-control-request-headers'] || 'authorization,content-type,x-oc-routing-plane'),
+  );
+  res.setHeader('access-control-max-age', '600');
+  res.setHeader('vary', 'origin');
+}
+
 const server = http.createServer(async (req, res) => {
   try {
+    applyCors(req, res);
     const url = new URL(req.url || '/', `http://${HOST}:${PORT}`);
-    if (req.method === 'GET' && url.pathname === '/health') {
-      return send(res, 200, { ok: true });
-    }
-    if (!authorized(req)) {
-      return send(res, 401, { ok: false, error: { code: 'unauthorized', message: 'Missing or invalid service token' } });
-    }
     if (req.method === 'OPTIONS') {
       res.writeHead(204, { 'cache-control': 'no-store' });
       return res.end();
+    }
+    if (req.method === 'GET' && url.pathname === '/health') {
+      return send(res, 200, { ok: true });
+    }
+    if (req.method === 'GET' && url.pathname === '/api/v1/instabox/bus-health') {
+      return send(res, 200, instaboxBusHealth());
+    }
+    if (!authorized(req)) {
+      return send(res, 401, { ok: false, error: { code: 'unauthorized', message: 'Missing or invalid service token' } });
     }
     await route(req, res, url);
   } catch (error) {

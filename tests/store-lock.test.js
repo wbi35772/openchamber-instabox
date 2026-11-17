@@ -10,6 +10,7 @@ const {
   atomicWriteFile,
   atomicWriteJson,
   withStateLock,
+  renameWithRetry,
   RuntimeDb,
 } = require('../lib/store-lock');
 
@@ -85,4 +86,64 @@ test('RuntimeDb stores, lists and persists rows', () => {
   reopened.delete('a/2');
   assert.equal(reopened.get('a/2'), null);
   reopened.close();
+});
+
+test('renameWithRetry retries EPERM and EBUSY before succeeding', () => {
+  const original = fs.renameSync;
+  const codes = ['EPERM', 'EBUSY'];
+  let attempts = 0;
+  fs.renameSync = () => {
+    attempts += 1;
+    if (codes.length) {
+      const error = new Error('target is locked');
+      error.code = codes.shift();
+      throw error;
+    }
+  };
+  try {
+    renameWithRetry('state.json.tmp', 'state.json');
+  } finally {
+    fs.renameSync = original;
+  }
+  assert.equal(attempts, 3);
+});
+
+test('renameWithRetry rethrows non-retryable errors immediately', () => {
+  const original = fs.renameSync;
+  let attempts = 0;
+  fs.renameSync = () => {
+    attempts += 1;
+    const error = new Error('missing source');
+    error.code = 'ENOENT';
+    throw error;
+  };
+  try {
+    assert.throws(
+      () => renameWithRetry('missing.tmp', 'state.json'),
+      (error) => error.code === 'ENOENT',
+    );
+  } finally {
+    fs.renameSync = original;
+  }
+  assert.equal(attempts, 1);
+});
+
+test('renameWithRetry gives up after five locked attempts', () => {
+  const original = fs.renameSync;
+  let attempts = 0;
+  fs.renameSync = () => {
+    attempts += 1;
+    const error = new Error('still locked');
+    error.code = 'EPERM';
+    throw error;
+  };
+  try {
+    assert.throws(
+      () => renameWithRetry('state.json.tmp', 'state.json'),
+      (error) => error.code === 'EPERM',
+    );
+  } finally {
+    fs.renameSync = original;
+  }
+  assert.equal(attempts, 5);
 });

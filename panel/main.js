@@ -385,6 +385,8 @@
     lastRefresh: 0,
     matrix: null,
     cf: null,
+    bus: { egress: null, cf: null, checkedAt: 0, probing: false },
+    drawer: null,
     modal: null,
     modalBusy: false,
     templatesByAccount: {},
@@ -484,6 +486,7 @@
       ]);
       state.matrix = pair[0] || state.matrix;
       state.cf = pair[1] || state.cf;
+      await probeBusHealth().catch(function () { return null; });
     } catch (error) {
       state.error = error;
     } finally {
@@ -711,6 +714,61 @@
     footerEl.textContent = '已同步 ' + clockNow() + ' · 共 ' + count + ' 台 · 15s 自动刷新';
   }
 
+  var BUS_HEALTH = {
+    egress: 'http://127.0.0.1:19880/api/v1/egress/bus-health',
+    cf: 'http://127.0.0.1:19882/api/v1/cf/bus-health',
+  };
+
+  function busState(key) {
+    var bus = state.bus && state.bus[key];
+    return bus && typeof bus === 'object' ? bus : null;
+  }
+
+  function probeBusEndpoint(url) {
+    var controller = typeof AbortController === 'function' ? new AbortController() : null;
+    var timer = setTimeout(function () {
+      if (controller) controller.abort();
+    }, 2500);
+    return fetch(url, {
+      cache: 'no-store',
+      signal: controller ? controller.signal : undefined,
+    }).then(function (response) {
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      return response.json();
+    }).then(function (body) {
+      return { ok: body && body.ok !== false, body: body || {}, checkedAt: Date.now() };
+    }).catch(function (error) {
+      return { ok: false, error: describeError(error), checkedAt: Date.now() };
+    }).then(function (result) {
+      if (timer) clearTimeout(timer);
+      return result;
+    });
+  }
+
+  function probeBusHealth() {
+    if (!state.bus || state.bus.probing) return Promise.resolve(null);
+    state.bus.probing = true;
+    var keys = Object.keys(BUS_HEALTH);
+    return Promise.all([
+      Promise.all(keys.map(function (key) {
+        return probeBusEndpoint(BUS_HEALTH[key]).then(function (result) {
+          state.bus[key] = result;
+          return result;
+        });
+      })),
+      service('GET', '/api/v1/instabox/bus-health', { timeoutMs: 4000 }).then(function (body) {
+        state.bus.instabox = { ok: body && body.ok !== false, body: body || {}, checkedAt: Date.now() };
+      }).catch(function (error) {
+        state.bus.instabox = { ok: false, error: describeError(error), checkedAt: Date.now() };
+      }),
+    ]).then(function () {
+      state.bus.probing = false;
+      state.bus.checkedAt = Date.now();
+      renderStatusCluster();
+      return state.bus;
+    });
+  }
+
   function renderStatusCluster() {
     var el = $('#oc-status');
     if (!el) return;
@@ -718,25 +776,58 @@
     var egress = (matrix && matrix.egress) || null;
     var slots = (egress && egress.slots) || [];
     var frozen = (egress && egress.frozenSlots) || [];
-    var connected = Boolean(egress && egress.connected);
-    var busError = Boolean(egress && egress.lastError);
+    var busEgress = busState('egress');
+    var busCf = busState('cf');
+    var cfBody = (busCf && busCf.body) || {};
+    var connected = busEgress ? busEgress.ok === true : Boolean(egress && egress.connected);
+    if (!connected && egress && egress.connected) connected = true;
+    var busError = Boolean((busEgress && busEgress.error) || (egress && egress.lastError));
     var egressTone = connected ? 'on' : (busError ? 'off' : 'warn');
     var cf = state.cf || null;
     var cfTone = 'warn';
     var cfLabel = '待命';
-    if (cf) {
-      if (cf.reachable === false || cf.ok === false) { cfTone = 'off'; cfLabel = '离线'; }
-      else { cfTone = 'on'; cfLabel = cf.degraded ? '降级' : '在线'; }
+    if (busCf && busCf.ok) {
+      cfTone = 'on';
+      cfLabel = 'ONLINE';
+    } else if (busCf || cf) {
+      if ((busCf && busCf.ok === false) || (cf && (cf.reachable === false || cf.ok === false))) {
+        cfTone = 'off';
+        cfLabel = 'OFFLINE';
+      } else {
+        cfTone = 'on';
+        cfLabel = cf && cf.degraded ? 'DEGRADED' : 'ONLINE';
+      }
     }
     var machines = machinesOf(state.overview);
-    var running = machines.filter(function (m) { return m.state === 'running'; }).length;
-    var active = slots.filter(function (slot) { return slot && slot.healthState === 'ACTIVE'; }).length;
+    var selfBus = busState('instabox');
+    var selfBody = (selfBus && selfBus.body) || {};
+    var running = Number(selfBody.runningMachines);
+    if (!Number.isFinite(running)) {
+      running = machines.filter(function (m) { return m.state === 'running'; }).length;
+    }
+    var active = Number(selfBody.activeLeases);
+    if (!Number.isFinite(active)) {
+      active = slots.filter(function (slot) { return slot && slot.healthState === 'ACTIVE'; }).length;
+    }
+    var tunnelled = Number(cfBody.activeTunnels);
+    if (!Number.isFinite(tunnelled)) tunnelled = Number(selfBody.tunnelledMachines);
+    if (!Number.isFinite(tunnelled)) {
+      tunnelled = ((matrix && matrix.tunnels) || []).filter(function (t) { return t && t.ok !== false; }).length;
+    }
+    var cooldown = Number(cfBody.cooldownCount);
+    if (Number.isFinite(cooldown) && cooldown > 0 && cfTone === 'on') {
+      cfTone = 'warn';
+      cfLabel = 'COOLDOWN ' + cooldown;
+    }
     el.innerHTML = [
-      '<span class="oc-lamp ' + egressTone + '" title="egress 总线 ' + esc((matrix && matrix.cf && matrix.cf.baseUrl) || '') + '">',
-      '<i></i>EGRESS <b>' + active + '/' + slots.length + '</b>',
-      (frozen.length ? ' <span style="color:var(--amber)">冻结 ' + frozen.length + '</span>' : ''),
+      '<span class="oc-lamp ' + egressTone + '" title="egress 总线 ' + esc(BUS_HEALTH.egress) + '">',
+      '<i></i>EGRESS: <b>' + (connected ? 'ONLINE' : 'OFFLINE') + '</b>',
+      ' <em>' + active + ' lease' + (frozen.length ? ' · 冻结 ' + frozen.length : '') + '</em>',
       '</span>',
-      '<span class="oc-lamp ' + cfTone + '" title="Cloudflare 隧道桥 ' + esc(cfLabel) + '"><i></i>CLOUDFLARE</span>',
+      '<span class="oc-lamp ' + cfTone + '" title="Cloudflare 隧道桥 ' + esc(BUS_HEALTH.cf) + '">',
+      '<i></i>CLOUDFLARE: <b>' + cfLabel + '</b>',
+      (tunnelled ? ' <em>' + tunnelled + ' tunnel</em>' : ''),
+      '</span>',
       '<span class="oc-count">' + running + ' / ' + machines.length + ' 实例</span>',
     ].join('');
   }
@@ -829,9 +920,10 @@
 
     if (hostname) {
       lines.push(
-        '<div class="matrix-line"><span class="label">TUNNEL</span><code title="' + esc(hostname) + '">' + esc(hostname) + '</code>',
+        '<div class="matrix-line"><span class="label">TUNNEL</span>',
+        '<button class="tunnel-host" data-act="terminal-drawer" data-machine="' + esc(machine.id) + '" data-account="' + esc(machine.account) + '" title="打开 Web 终端">' + esc(hostname) + '</button>',
         '<button data-act="copy" data-copy="' + esc(hostname) + '" title="复制域名">' + icon('copy') + '</button>',
-        '<button data-act="attach" data-machine="' + esc(machine.id) + '" data-account="' + esc(machine.account) + '" title="打开终端">' + icon('terminal') + '</button>',
+        '<button data-act="terminal-drawer" data-machine="' + esc(machine.id) + '" data-account="' + esc(machine.account) + '" title="打开终端">' + icon('terminal') + '</button>',
         '</div>',
       );
     }
@@ -2337,18 +2429,21 @@
     try { term.write(text); } catch (error) { /* ignore */ }
   };
 
-  function stopTerminal() {
-    var t = state.modal && state.modal.terminal;
-    if (!t) return;
-    t.disposed = true;
-    if (t.timer) { clearInterval(t.timer); t.timer = null; }
-    if (t.guard) { clearInterval(t.guard); t.guard = null; }
-    if (t.observer) { try { t.observer.disconnect(); } catch (error) { /* ignore */ } t.observer = null; }
-    if (t.term) { try { t.term.dispose(); } catch (error) { /* ignore */ } t.term = null; }
-    if (state.modal) state.modal.terminal = null;
-    if (t.sessionId) {
-      void service('DELETE', '/api/terminal/' + encodeURIComponent(t.sessionId), { timeoutMs: 10000 }).catch(function () {});
-    }
+  function stopTerminal(owner) {
+    var holders = owner ? [owner] : [state.modal, state.drawer];
+    holders.forEach(function (holder) {
+      var t = holder && holder.terminal;
+      if (!t) return;
+      t.disposed = true;
+      if (t.timer) { clearInterval(t.timer); t.timer = null; }
+      if (t.guard) { clearInterval(t.guard); t.guard = null; }
+      if (t.observer) { try { t.observer.disconnect(); } catch (error) { /* ignore */ } t.observer = null; }
+      if (t.term) { try { t.term.dispose(); } catch (error) { /* ignore */ } t.term = null; }
+      holder.terminal = null;
+      if (t.sessionId) {
+        void service('DELETE', '/api/terminal/' + encodeURIComponent(t.sessionId), { timeoutMs: 10000 }).catch(function () {});
+      }
+    });
   }
 
   function stopTerminalPoll(t, text, tone) {
@@ -2419,11 +2514,12 @@
     }
   }
 
-  async function startTerminal(machine) {
+  async function startTerminal(machine, owner) {
     var host = $('#terminal-host');
-    if (!host || !state.modal) return;
+    var holder = owner || state.modal;
+    if (!host || !holder) return;
     var t = { disposed: false, timer: null, polling: false, cursor: 0, sessionId: null, term: null, observer: null, guard: null };
-    state.modal.terminal = t;
+    holder.terminal = t;
     if (typeof window.Terminal !== 'function') {
       setTerminalState('xterm 未加载', 'bad');
       return;
@@ -2521,6 +2617,43 @@
       setTerminalState(describeError(error), 'bad');
       terminalWrite(term, '\x1b[38;5;203m' + describeError(error) + '\x1b[0m\r\n');
     }
+  }
+
+  function drawerTarget(machine) {
+    if (!machine) return '';
+    return String(machine.name || machine.id || '');
+  }
+
+  function openTerminalDrawer(machine) {
+    if (!machine) return;
+    var root = $('#terminal-drawer');
+    if (!root) return;
+    stopTerminal(state.modal);
+    stopTerminal(state.drawer);
+    state.drawer = { machine: machine, terminal: null };
+    root.hidden = false;
+    root.innerHTML = [
+      '<div class="terminal-drawer-head">',
+      '<span class="drawer-kicker">TERMINAL</span>',
+      '<code class="drawer-target">' + esc(drawerTarget(machine)) + '</code>',
+      '<span class="tag ok" id="terminal-state">连接中…</span>',
+      '<span class="grow"></span>',
+      '<span class="terminal-metrics" id="terminal-metrics"></span>',
+      '<button class="icon-btn" data-act="close-terminal-drawer" aria-label="关闭终端" title="关闭终端">' + icon('close') + '</button>',
+      '</div>',
+      '<div class="terminal-host" id="terminal-host"></div>',
+    ].join('');
+    void startTerminal(machine, state.drawer);
+  }
+
+  function closeTerminalDrawer() {
+    stopTerminal(state.drawer);
+    var root = $('#terminal-drawer');
+    if (root) {
+      root.hidden = true;
+      root.innerHTML = '';
+    }
+    state.drawer = null;
   }
 
   async function loadDetailTab(machine, tab, force) {
@@ -3502,6 +3635,14 @@
       if (act === 'ports') { openModal({ kind: 'ports', machine: machineFrom(el) }); return; }
       if (act === 'attach') {
         withButton(el, function () { return attachMachine(machineFrom(el)); });
+        return;
+      }
+      if (act === 'terminal-drawer') {
+        openTerminalDrawer(machineFrom(el));
+        return;
+      }
+      if (act === 'close-terminal-drawer') {
+        closeTerminalDrawer();
         return;
       }
       if (act === 'delete') { openModal({ kind: 'delete', machine: machineFrom(el) }); return; }

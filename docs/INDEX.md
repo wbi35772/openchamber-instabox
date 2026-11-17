@@ -1,6 +1,6 @@
 # 文档索引
 
-> 仓库：`wbi35772/openchamber-instabox`（私有） · 扩展 ID：`instabox-matrix` · 当前版本 v1.7.0
+> 仓库：`wbi35772/openchamber-instabox`（私有） · 扩展 ID：`instabox-matrix` · 当前版本 v1.8.0
 
 ## 全景文档（推荐先看）
 
@@ -46,7 +46,8 @@ node scripts/docs-canvas.js --no-viewer # 只写 artifact
 | `lib/instabox.js` | Instabox REST 客户端：错误映射、幂等键、限流、超时。 |
 | `core/contract.js` | 统一合约：矩阵槽位、端口、平面、健康态、指纹；与 egress / cloudflare 对齐。 |
 | `lib/egress-client.js` | 19880 HTTP/WS 客户端：槽位核验、租约绑定、换血冻结 ACK、重连与缓存。 |
-| `lib/cf-bridge.js` | 19882 桥接：CF Tunnel provision / teardown / status 与 cloudflared 注入。 |
+| `lib/cf-bridge.js` | 19882 桥接：CF Tunnel provision / teardown / status、cloudflared 注入与掉线自愈。 |
+| `lib/jobs.js` | 异步任务与指数退避重试队列（`retry` / `cancel`），pending 不被 TTL 清理。 |
 | `lib/account-proxy.js` | 槽位解析、transport 注册表、egress 门禁、冻结/恢复、status/probe/release。 |
 | `lib/account-transport.js` | 每账号的 fetch 与 WebSocket 隧道；无端口 fail-closed。 |
 | `lib/proxy-fetch.js` | CONNECT、TLS 升级、配额、隔离、半开探测、隧道 Agent。 |
@@ -59,6 +60,8 @@ node scripts/docs-canvas.js --no-viewer # 只写 artifact
 | `service/main.js` | 本地 HTTP 服务（127.0.0.1），含 `/api/matrix/*` 与 `/api/cf/*`。 |
 | `mcp/server.js` | MCP stdio 服务，19 个工具。 |
 | `scripts/sync.mjs` | 幂等安装与 `--check` 对齐检查。 |
+| `scripts/verify-trinity-matrix.mjs` | 三仓四阶段验收：`--slots a,b,c` 逐槽契约；阶段 4 内嵌 stub 探针（4.5）。 |
+| `scripts/probe-cf-provision.mjs` | CF provision/teardown 契约探针：本地 Cloudflare stub + 24010 代理，7 项断言。 |
 | `scripts/singbox-up.js` / `scripts/sub2port-serve.js` | 默认委托 19880 槽位租约；`--standalone-fallback` 启用本地 sing-box。 |
 
 ## 维护约定

@@ -56,3 +56,75 @@ test('unknown job ids return null', () => {
   const jobs = createJobs();
   assert.equal(jobs.get('job-does-not-exist'), null);
 });
+
+test('retry starts pending and runs the first attempt after the delay', async () => {
+  const jobs = createJobs();
+  let calls = 0;
+  const job = jobs.retry(async () => { calls += 1; return 'ok'; }, { tag: 't' }, { attempts: 3, delayMs: 20 });
+  assert.equal(job.status, 'pending');
+  assert.equal(jobs.get(job.id).status, 'pending');
+  assert.equal(calls, 0);
+  await delay(60);
+  const done = jobs.get(job.id);
+  assert.equal(done.status, 'done');
+  assert.equal(done.result, 'ok');
+  assert.equal(done.attempt, 1);
+  assert.equal(calls, 1);
+});
+
+test('retry backs off and succeeds on a later attempt', async () => {
+  const jobs = createJobs();
+  let calls = 0;
+  const job = jobs.retry(
+    async () => {
+      calls += 1;
+      if (calls < 3) throw new Error('cold start');
+      return 'ready';
+    },
+    {},
+    { attempts: 4, delayMs: 10, factor: 1, maxDelayMs: 20 },
+  );
+  await delay(120);
+  const done = jobs.get(job.id);
+  assert.equal(calls, 3);
+  assert.equal(done.status, 'done');
+  assert.equal(done.result, 'ready');
+  assert.equal(done.attempt, 3);
+});
+
+test('retry marks the job as error after the final attempt', async () => {
+  const jobs = createJobs();
+  const job = jobs.retry(
+    async () => { throw new Error('still cooling'); },
+    {},
+    { attempts: 2, delayMs: 5, factor: 1, maxDelayMs: 5 },
+  );
+  await delay(80);
+  const failed = jobs.get(job.id);
+  assert.equal(failed.status, 'error');
+  assert.match(failed.error.message, /still cooling/);
+  assert.equal(failed.retriesExhausted, true);
+});
+
+test('pending retry jobs are not pruned by the ttl', async () => {
+  const jobs = createJobs({ ttlMs: 10 });
+  const job = jobs.retry(async () => 'late', {}, { attempts: 2, delayMs: 40 });
+  await delay(25);
+  assert.ok(jobs.get(job.id), 'pending job survives ttl prune');
+  jobs.cancel(job.id);
+});
+
+test('cancel stops a pending retry from running', async () => {
+  const jobs = createJobs();
+  let calls = 0;
+  const job = jobs.retry(
+    async () => { calls += 1; return 'never'; },
+    {},
+    { attempts: 3, delayMs: 20 },
+  );
+  const cancelled = jobs.cancel(job.id);
+  assert.equal(cancelled.status, 'cancelled');
+  await delay(60);
+  assert.equal(calls, 0);
+  assert.equal(jobs.get(job.id).status, 'cancelled');
+});

@@ -1,5 +1,22 @@
 # 变更记录
 
+## 1.8.0 — 2026-11-17
+
+跨仓库联调收官：隧道自愈、换血屏障、bus-health 互通与面板终端抽屉。
+
+- `lib/cf-bridge.js`：新增 `isCooldownError` / `isRetryableError` / `retryAfterMs` 分类，`tokenCache` 缓存 provision token；新增 `checkCloudflared` / `restartCloudflared` / `ensureMachine` / `forgetToken` / `hasCachedToken`，掉线可用缓存 token 自动重拉。
+- `lib/jobs.js`：新增 `retry(task, meta, options)` 异步重试队列（指数退避、`pending` 不参与 TTL 清理）、`cancel(id)`；`finish` 支持 `pending → done/error`。
+- `service/main.js`：CF 隧道 provision 遇 `COOLDOWN` 不再让开机失败，改投后台重试队列（6 次 / 15s×2 / 上限 5min，销毁前取消）；新增隧道与重启心跳；开启 CORS 并新增公开 `GET /api/v1/instabox/bus-health`（`runningMachines` / `activeLeases` / `tunnelledMachines`）。
+- `lib/proxy-fetch.js`：冻结后恢复阶段新增最长 `1500ms` 内存屏障（`waitForResume`），`close` 释放等待者避免悬挂；`lib/account-transport.js` 透传 `resumeBarrierMs`。
+- `lib/leases.js`：心跳先过恢复屏障，被冻结/隔离时返回 `deferred` 补丁而不是失败；`tickEntries` 同样记为 deferred。
+- `lib/keepalive.js`：新增隧道心跳钩子（`tunnelCheckMs` 默认 60s），实例内 `cloudflared` 掉线时用缓存 token 自动重启。
+- `lib/store-lock.js`：`renameWithRetry` 对 Windows `EPERM` / `EBUSY` / `EACCES` 做 5 次退避重试，接入原子写。
+- `lib/cf-bridge.js`：HTTP 请求携带 `Authorization: Bearer`（`OPENCHAMBER_CF_TOKEN`），provision 直发 CF 原生字段 `domainZone` / `localPort` / `publicHostname`；teardown 透传并持久化 `tunnelId`，重拉隧道时同样带上。
+- 面板顶栏实时探测 Egress（19880）、Cloudflare（19882）与本服务 bus-health，CF 冷却显示 `COOLDOWN n`；点击卡片 `publicHostname` 直接呼出底部 xterm 终端抽屉。
+- 测试新增 27 条（jobs retry/cancel、CF 自愈、恢复屏障、隧道心跳、bus-health/CORS），总计 280 条通过。
+- `scripts/verify-trinity-matrix.mjs`：新增 `--slots a,b,c` 多槽位验收（不传时自动取最多 3 个 ACTIVE，第一个驱动阶段 2-4）；阶段 4 内嵌 `scripts/probe-cf-provision.mjs` 输出 4.5 行。
+- `scripts/probe-cf-provision.mjs`：CF provision/teardown 契约探针（本地 Cloudflare stub + 24010–24150 自动选空闲代理端口，7 项断言）；报告明确标注 `upstream=stub`，不把真实账号缺失记为 PASS。
+
 ## 1.7.1 — 2026-11-17
 
 与 cloudflare 契约补齐：provision / teardown 载荷带 `vmInstanceId`，并支持沙箱内服务端口。

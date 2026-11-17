@@ -1,6 +1,6 @@
 {
   "name": "openchamber-instabox",
-  "version": "1.7.1",
+  "version": "1.8.0",
   "private": true,
   "description": "OpenChamber extension: multi-account Instabox machine matrix, zero-direct proxy egress, local service and MCP agent tools.",
   "license": "MIT",

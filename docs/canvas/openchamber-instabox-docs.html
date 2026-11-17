@@ -249,8 +249,8 @@
       </div>
     </div>
     <div class="top-actions">
-      <span class="badge done">v1.7.0</span>
-      <span class="badge">252 tests</span>
+      <span class="badge done">v1.8.0</span>
+      <span class="badge">279 tests</span>
       <button class="btn" id="theme-toggle" title="切换明暗主题">☾ 主题</button>
       <button class="btn" id="print-btn" title="打印 / 导出 PDF">⎙ 打印</button>
       <button class="btn primary" id="repo-btn" title="打开 GitHub 私有仓库">↗ 仓库</button>
@@ -308,7 +308,7 @@
       <div class="stat"><b>24</b><span>lib 模块（无第三方依赖）</span></div>
       <div class="stat"><b>19</b><span>MCP 工具</span></div>
       <div class="stat"><b>9</b><span>机器详情 tab</span></div>
-      <div class="stat"><b>252</b><span>自动化测试 · 全通过</span></div>
+      <div class="stat"><b>279</b><span>自动化测试 · 全通过</span></div>
       <div class="stat"><b>14</b><span>REST 路由组</span></div>
       <div class="stat"><b>0</b><span>运行时 npm 依赖</span></div>
     </div>
@@ -464,7 +464,7 @@
           <tr><td class="mono">account-proxy.js</td><td>槽位解析、transport 注册表、egress 门禁、冻结/恢复、status / probe / release</td><td><span class="tag core">代理</span></td></tr>
           <tr><td class="mono">account-transport.js</td><td>每 alias 的 fetch 与 WebSocket 隧道；双平面头；无端口 fail-closed</td><td><span class="tag core">代理</span></td></tr>
           <tr><td class="mono">egress-client.js</td><td>19880 HTTP/WS：槽位核验、租约、换血冻结 ACK、重连缓存</td><td><span class="tag core">出口</span></td></tr>
-          <tr><td class="mono">cf-bridge.js</td><td>19882 桥接：CF Tunnel provision / teardown / status、cloudflared 注入</td><td><span class="tag ops">隧道</span></td></tr>
+          <tr><td class="mono">cf-bridge.js</td><td>19882 桥接：CF Tunnel provision / teardown / status、cloudflared 注入与掉线自愈</td><td><span class="tag ops">隧道</span></td></tr>
           <tr><td class="mono">contract.js（core/）</td><td>统一合约：槽位、端口、平面、健康态、指纹、租约校验</td><td><span class="tag core">合约</span></td></tr>
           <tr><td class="mono">proxy-fetch.js</td><td>CONNECT、TLS 升级、配额、隔离、半开探测、隧道 Agent</td><td><span class="tag core">代理</span></td></tr>
           <tr><td class="mono">ws.js</td><td>自实现 WebSocket：握手、帧、分片、ping</td><td><span class="tag io">网络</span></td></tr>
@@ -547,6 +547,7 @@
           <li>每个控制面请求带 <code>X-OC-Routing-Plane: STRICT_CONTROL</code> 与槽位 <code>Proxy-Authorization</code>。</li>
           <li>发包前 <code>assertSlotUsable()</code> 核验实时健康态；<code>WARP_OVERFLOW</code> / <code>ROTATING</code> / <code>QUARANTINED</code> 直接 503。</li>
           <li>守 WS：<code>PRE_ROTATION_FREEZE</code> 暂停该槽 keepalive/jobs、销毁连接池并回 <code>ack-freeze</code>；<code>POST_ROTATION_RESUME</code> 刷新指纹并恢复。</li>
+          <li>恢复阶段对在途请求加最多 1500ms 屏障；被冻结/隔离的租约心跳返回 <code>deferred</code> 而不是失败。</li>
         </ul>
       </div>
       <div class="card">
@@ -556,6 +557,7 @@
           <li>隧道 token 只经一次 <code>noHistory</code> exec 注入实例，不写状态、不进日志与响应。</li>
           <li>实例内执行 <code>cloudflared tunnel run --token … --no-autoupdate --protocol http2</code>。</li>
           <li>回收/删除前 <code>POST /api/v1/cf/tunnel/teardown</code>；404 视为已释放。</li>
+          <li>provision 遇 <code>COOLDOWN</code> 投后台退避重试，不再让开机失败；心跳检测实例内 <code>cloudflared</code>，掉线用缓存 token 自动重拉。</li>
         </ul>
       </div>
     </div>
@@ -807,6 +809,7 @@ port = 24000 + index
       <tr><td class="mono">GET · PUT /api/recycle · POST /api/recycle/run</td><td>回收配置 / 立即执行</td></tr>
       <tr><td class="mono">GET · POST /api/netprobe</td><td>出口与运行时 IP 探测</td></tr>
       <tr><td class="mono">GET /api/cf/status · POST /api/cf/tunnel/provision · POST /api/cf/tunnel/teardown</td><td>Cloudflare 桥接状态、隧道开通与释放（19882）</td></tr>
+      <tr><td class="mono">GET /api/v1/instabox/bus-health</td><td>公开且 CORS 的矩阵总线健康（运行实例 / 活动租约 / 已隧道），位于鉴权之前</td></tr>
       <tr><td class="mono">GET /api/jobs/:id</td><td>异步命令状态</td></tr>
     </tbody></table></div></details>
     <details class="exp"><summary>文件、终端、桌面、SSH</summary><div class="body"><table><tbody>
@@ -902,56 +905,56 @@ port = 24000 + index
   </section>
 
   <section class="panel" id="panel-quality" role="tabpanel" aria-labelledby="tabbtn-quality" hidden>
-    <div class="section-title"><h2>测试分布</h2><p>40 个测试文件 · 252 条用例 · 全通过（约 1034 ms）</p></div>
+    <div class="section-title"><h2>测试分布</h2><p>41 个测试文件 · 279 条用例 · 全通过（约 992 ms）</p></div>
     <div class="bars">
-      <div class="bar-row"><span class="name">leases.test.js</span><span class="track"><span class="fill" style="width:100%"></span></span><span class="num">16</span></div>
-      <div class="bar-row"><span class="name">tokens-desktop.test.js</span><span class="track"><span class="fill" style="width:94%"></span></span><span class="num">15</span></div>
-      <div class="bar-row"><span class="name">sub2port.test.js</span><span class="track"><span class="fill" style="width:75%"></span></span><span class="num">12</span></div>
-      <div class="bar-row"><span class="name">terminal.test.js</span><span class="track"><span class="fill" style="width:75%"></span></span><span class="num">12</span></div>
-      <div class="bar-row"><span class="name">files.test.js</span><span class="track"><span class="fill" style="width:69%"></span></span><span class="num">11</span></div>
-      <div class="bar-row"><span class="name">update-settings.test.js</span><span class="track"><span class="fill" style="width:69%"></span></span><span class="num">11</span></div>
-      <div class="bar-row"><span class="name">sub2port-delegation.test.js</span><span class="track"><span class="fill" style="width:69%"></span></span><span class="num">11</span></div>
-      <div class="bar-row"><span class="name">netprobe.test.js</span><span class="track"><span class="fill" style="width:63%"></span></span><span class="num">10</span></div>
-      <div class="bar-row"><span class="name">cf-bridge.test.js</span><span class="track"><span class="fill" style="width:63%"></span></span><span class="num">10</span></div>
-      <div class="bar-row"><span class="name">machines-create.test.js</span><span class="track"><span class="fill" style="width:50%"></span></span><span class="num">8</span></div>
-      <div class="bar-row"><span class="name">egress-client.test.js</span><span class="track"><span class="fill" style="width:50%"></span></span><span class="num">8</span></div>
-      <div class="bar-row"><span class="name">egress-gate.test.js</span><span class="track"><span class="fill" style="width:50%"></span></span><span class="num">8</span></div>
-      <div class="bar-row"><span class="name">inventory.test.js</span><span class="track"><span class="fill" style="width:44%"></span></span><span class="num">7</span></div>
-      <div class="bar-row"><span class="name">egress-contract.test.js</span><span class="track"><span class="fill" style="width:44%"></span></span><span class="num">7</span></div>
-      <div class="bar-row"><span class="name">canvas-page.test.js</span><span class="track"><span class="fill" style="width:38%"></span></span><span class="num">6</span></div>
-      <div class="bar-row"><span class="name">client.test.js</span><span class="track"><span class="fill" style="width:38%"></span></span><span class="num">6</span></div>
-      <div class="bar-row"><span class="name">inspect.test.js</span><span class="track"><span class="fill" style="width:38%"></span></span><span class="num">6</span></div>
-      <div class="bar-row"><span class="name">proxy-fetch.test.js</span><span class="track"><span class="fill" style="width:38%"></span></span><span class="num">6</span></div>
-      <div class="bar-row"><span class="name">ratelimit-scheduler.test.js</span><span class="track"><span class="fill" style="width:38%"></span></span><span class="num">6</span></div>
-      <div class="bar-row"><span class="name">ws.test.js</span><span class="track"><span class="fill" style="width:38%"></span></span><span class="num">6</span></div>
-      <div class="bar-row"><span class="name">account-proxy.test.js</span><span class="track"><span class="fill" style="width:31%"></span></span><span class="num">5</span></div>
-      <div class="bar-row"><span class="name">canvas.test.js</span><span class="track"><span class="fill" style="width:31%"></span></span><span class="num">5</span></div>
-      <div class="bar-row"><span class="name">inventory-probe.test.js</span><span class="track"><span class="fill" style="width:31%"></span></span><span class="num">5</span></div>
-      <div class="bar-row"><span class="name">jobs.test.js</span><span class="track"><span class="fill" style="width:31%"></span></span><span class="num">5</span></div>
-      <div class="bar-row"><span class="name">matrix-p2.test.js</span><span class="track"><span class="fill" style="width:31%"></span></span><span class="num">5</span></div>
-      <div class="bar-row"><span class="name">store-lock.test.js</span><span class="track"><span class="fill" style="width:31%"></span></span><span class="num">5</span></div>
-      <div class="bar-row"><span class="name">uptime.test.js</span><span class="track"><span class="fill" style="width:31%"></span></span><span class="num">5</span></div>
-      <div class="bar-row"><span class="name">proxy-settings.test.js</span><span class="track"><span class="fill" style="width:25%"></span></span><span class="num">4</span></div>
-      <div class="bar-row"><span class="name">recycle-plan.test.js</span><span class="track"><span class="fill" style="width:25%"></span></span><span class="num">4</span></div>
-      <div class="bar-row"><span class="name">recycle-run.test.js</span><span class="track"><span class="fill" style="width:25%"></span></span><span class="num">4</span></div>
-      <div class="bar-row"><span class="name">account-transport.test.js</span><span class="track"><span class="fill" style="width:19%"></span></span><span class="num">3</span></div>
-      <div class="bar-row"><span class="name">recycle-store.test.js</span><span class="track"><span class="fill" style="width:19%"></span></span><span class="num">3</span></div>
-      <div class="bar-row"><span class="name">store-update.test.js</span><span class="track"><span class="fill" style="width:19%"></span></span><span class="num">3</span></div>
-      <div class="bar-row"><span class="name">generic-isolation.test.js</span><span class="track"><span class="fill" style="width:13%"></span></span><span class="num">2</span></div>
-      <div class="bar-row"><span class="name">instabox-power.test.js</span><span class="track"><span class="fill" style="width:13%"></span></span><span class="num">2</span></div>
-      <div class="bar-row"><span class="name">recycle-cli.test.js</span><span class="track"><span class="fill" style="width:13%"></span></span><span class="num">2</span></div>
-      <div class="bar-row"><span class="name">recycle-keepalive.test.js</span><span class="track"><span class="fill" style="width:13%"></span></span><span class="num">2</span></div>
-      <div class="bar-row"><span class="name">recycle-view.test.js</span><span class="track"><span class="fill" style="width:13%"></span></span><span class="num">2</span></div>
-      <div class="bar-row"><span class="name">store-lock-owned.test.js</span><span class="track"><span class="fill" style="width:13%"></span></span><span class="num">2</span></div>
-      <div class="bar-row"><span class="name">update-api.test.js</span><span class="track"><span class="fill" style="width:6%"></span></span><span class="num">1</span></div>
+      <div class="bar-row"><span class="name">leases.test.js</span><span class="track"><span class="fill" style="width:100%"></span></span><span class="num">19</span></div>
+      <div class="bar-row"><span class="name">cf-bridge.test.js</span><span class="track"><span class="fill" style="width:95%"></span></span><span class="num">18</span></div>
+      <div class="bar-row"><span class="name">tokens-desktop.test.js</span><span class="track"><span class="fill" style="width:79%"></span></span><span class="num">15</span></div>
+      <div class="bar-row"><span class="name">sub2port.test.js</span><span class="track"><span class="fill" style="width:63%"></span></span><span class="num">12</span></div>
+      <div class="bar-row"><span class="name">terminal.test.js</span><span class="track"><span class="fill" style="width:63%"></span></span><span class="num">12</span></div>
+      <div class="bar-row"><span class="name">sub2port-delegation.test.js</span><span class="track"><span class="fill" style="width:58%"></span></span><span class="num">11</span></div>
+      <div class="bar-row"><span class="name">update-settings.test.js</span><span class="track"><span class="fill" style="width:58%"></span></span><span class="num">11</span></div>
+      <div class="bar-row"><span class="name">files.test.js</span><span class="track"><span class="fill" style="width:58%"></span></span><span class="num">11</span></div>
+      <div class="bar-row"><span class="name">netprobe.test.js</span><span class="track"><span class="fill" style="width:53%"></span></span><span class="num">10</span></div>
+      <div class="bar-row"><span class="name">jobs.test.js</span><span class="track"><span class="fill" style="width:53%"></span></span><span class="num">10</span></div>
+      <div class="bar-row"><span class="name">proxy-fetch.test.js</span><span class="track"><span class="fill" style="width:53%"></span></span><span class="num">10</span></div>
+      <div class="bar-row"><span class="name">egress-client.test.js</span><span class="track"><span class="fill" style="width:42%"></span></span><span class="num">8</span></div>
+      <div class="bar-row"><span class="name">egress-gate.test.js</span><span class="track"><span class="fill" style="width:42%"></span></span><span class="num">8</span></div>
+      <div class="bar-row"><span class="name">machines-create.test.js</span><span class="track"><span class="fill" style="width:42%"></span></span><span class="num">8</span></div>
+      <div class="bar-row"><span class="name">store-lock.test.js</span><span class="track"><span class="fill" style="width:42%"></span></span><span class="num">8</span></div>
+      <div class="bar-row"><span class="name">inventory.test.js</span><span class="track"><span class="fill" style="width:37%"></span></span><span class="num">7</span></div>
+      <div class="bar-row"><span class="name">egress-contract.test.js</span><span class="track"><span class="fill" style="width:37%"></span></span><span class="num">7</span></div>
+      <div class="bar-row"><span class="name">ws.test.js</span><span class="track"><span class="fill" style="width:32%"></span></span><span class="num">6</span></div>
+      <div class="bar-row"><span class="name">ratelimit-scheduler.test.js</span><span class="track"><span class="fill" style="width:32%"></span></span><span class="num">6</span></div>
+      <div class="bar-row"><span class="name">inspect.test.js</span><span class="track"><span class="fill" style="width:32%"></span></span><span class="num">6</span></div>
+      <div class="bar-row"><span class="name">client.test.js</span><span class="track"><span class="fill" style="width:32%"></span></span><span class="num">6</span></div>
+      <div class="bar-row"><span class="name">canvas-page.test.js</span><span class="track"><span class="fill" style="width:32%"></span></span><span class="num">6</span></div>
+      <div class="bar-row"><span class="name">account-proxy.test.js</span><span class="track"><span class="fill" style="width:26%"></span></span><span class="num">5</span></div>
+      <div class="bar-row"><span class="name">uptime.test.js</span><span class="track"><span class="fill" style="width:26%"></span></span><span class="num">5</span></div>
+      <div class="bar-row"><span class="name">canvas.test.js</span><span class="track"><span class="fill" style="width:26%"></span></span><span class="num">5</span></div>
+      <div class="bar-row"><span class="name">matrix-p2.test.js</span><span class="track"><span class="fill" style="width:26%"></span></span><span class="num">5</span></div>
+      <div class="bar-row"><span class="name">recycle-keepalive.test.js</span><span class="track"><span class="fill" style="width:26%"></span></span><span class="num">5</span></div>
+      <div class="bar-row"><span class="name">proxy-settings.test.js</span><span class="track"><span class="fill" style="width:26%"></span></span><span class="num">5</span></div>
+      <div class="bar-row"><span class="name">inventory-probe.test.js</span><span class="track"><span class="fill" style="width:26%"></span></span><span class="num">5</span></div>
+      <div class="bar-row"><span class="name">recycle-run.test.js</span><span class="track"><span class="fill" style="width:21%"></span></span><span class="num">4</span></div>
+      <div class="bar-row"><span class="name">recycle-plan.test.js</span><span class="track"><span class="fill" style="width:21%"></span></span><span class="num">4</span></div>
+      <div class="bar-row"><span class="name">account-transport.test.js</span><span class="track"><span class="fill" style="width:16%"></span></span><span class="num">3</span></div>
+      <div class="bar-row"><span class="name">store-update.test.js</span><span class="track"><span class="fill" style="width:16%"></span></span><span class="num">3</span></div>
+      <div class="bar-row"><span class="name">recycle-store.test.js</span><span class="track"><span class="fill" style="width:16%"></span></span><span class="num">3</span></div>
+      <div class="bar-row"><span class="name">store-lock-owned.test.js</span><span class="track"><span class="fill" style="width:11%"></span></span><span class="num">2</span></div>
+      <div class="bar-row"><span class="name">recycle-view.test.js</span><span class="track"><span class="fill" style="width:11%"></span></span><span class="num">2</span></div>
+      <div class="bar-row"><span class="name">instabox-power.test.js</span><span class="track"><span class="fill" style="width:11%"></span></span><span class="num">2</span></div>
+      <div class="bar-row"><span class="name">generic-isolation.test.js</span><span class="track"><span class="fill" style="width:11%"></span></span><span class="num">2</span></div>
+      <div class="bar-row"><span class="name">recycle-cli.test.js</span><span class="track"><span class="fill" style="width:11%"></span></span><span class="num">2</span></div>
+      <div class="bar-row"><span class="name">service-bus-health.test.js</span><span class="track"><span class="fill" style="width:5%"></span></span><span class="num">1</span></div>
+      <div class="bar-row"><span class="name">update-api.test.js</span><span class="track"><span class="fill" style="width:5%"></span></span><span class="num">1</span></div>
     </div>
-
     <div class="section-title"><h2>关键验证证据</h2><p>自动化 + 真机</p></div>
     <div class="table-wrap">
       <table>
         <thead><tr><th>项</th><th>结果</th><th>证据</th></tr></thead>
         <tbody>
-          <tr><td>全量测试</td><td><span class="badge done">252 / 252</span></td><td><code>npm test</code>，0 fail，约 1034 ms</td></tr>
+          <tr><td>全量测试</td><td><span class="badge done">279 / 279</span></td><td><code>npm test</code>，0 fail，约 992 ms</td></tr>
           <tr><td>无端口 fail-closed</td><td><span class="badge done">通过</span></td><td>account-transport.test.js 抛出 503 错误码</td></tr>
           <tr><td>无槽位拒绝直连</td><td><span class="badge done">通过</span></td><td><code>requireFetchFor('ghost')</code> 抛错；candidate 可分配</td></tr>
           <tr><td>WS 经代理</td><td><span class="badge done">通过</span></td><td>本地 CONNECT 代理 + WS 回显 <code>echo:hello</code></td></tr>
@@ -969,7 +972,7 @@ port = 24000 + index
       </table>
     </div>
     <div class="copy-wrap" style="margin-top:14px"><button class="btn copy" data-copy="npm test">复制</button><pre>npm test
-<span class="c"># tests 252 · pass 252 · fail 0</span>
+<span class="c"># tests 279 · pass 279 · fail 0</span>
 
 node scripts/sync.mjs --check
 <span class="c"># sync check: everything matches …</span></pre></div>
@@ -983,8 +986,9 @@ node scripts/sync.mjs --check
       <div class="tl-item done"><h4>v1.5.0 · 机器 Canvas 与自更新</h4><p>机器页 artifact 版本化；git 代理通道；曲线与规模分析。</p></div>
       <div class="tl-item done"><h4>v1.6.0 · 零直连传输</h4><p>per-alias transport、WS 隧道、fail-closed、私有仓库 openchamber-instabox。</p></div>
       <div class="tl-item done"><h4>v1.7.0 · Egress Matrix 与 CF Tunnel</h4><p>出口移交 19880（固定槽位、租约、换血冻结 ack）、CF 19882 tunnel provision/teardown、面板矩阵化与批量操作。</p></div>
-      <div class="tl-item next"><h4>v1.8.0 · SQLite 与粘性持久化</h4><p><code>node:sqlite</code> WAL；accounts / machines / leases / recycle_status 分表；槽位与隧道映射落库。</p></div>
-      <div class="tl-item"><h4>v1.9.0 · 调度与指纹</h4><p>每账号在途 1 + 相位偏移；统一 UA/TLS persona；代理健康分。</p></div>
+      <div class="tl-item done"><h4>v1.8.0 · 跨仓库联调收官</h4><p>CF 冷却后台重试与 cloudflared 自愈、换血恢复 1500ms 屏障、bus-health 三源顶栏、publicHostname 点击终端抽屉。</p></div>
+      <div class="tl-item next"><h4>v1.9.0 · SQLite 与粘性持久化</h4><p><code>node:sqlite</code> WAL；accounts / machines / leases / recycle_status 分表；槽位与隧道映射落库。</p></div>
+      <div class="tl-item"><h4>v1.10.0 · 调度与指纹</h4><p>每账号在途 1 + 相位偏移；统一 UA/TLS persona；代理健康分。</p></div>
       <div class="tl-item"><h4>v2.0.0 · 分片与高可用</h4><p>worker 池、多 sing-box、审计日志、200–500 账号压测。</p></div>
     </div>
 
@@ -1026,7 +1030,7 @@ node scripts/sync.mjs --check
 cd openchamber-instabox
 node scripts/sync.mjs
 <span class="c"># 重启 OpenChamber 加载扩展</span></pre></div>
-    <div class="copy-wrap"><button class="btn copy" data-copy="npm test">复制</button><pre>npm test                      <span class="c"># 252 tests</span>
+    <div class="copy-wrap"><button class="btn copy" data-copy="npm test">复制</button><pre>npm test                      <span class="c"># 279 tests</span>
 node scripts/sync.mjs --check <span class="c"># 安装副本对齐</span>
 node scripts/singbox-up.js    <span class="c"># 默认委托 19880；--standalone-fallback 才本地 sing-box</span>
 node scripts/recycle.js --dry-run
@@ -1059,7 +1063,7 @@ service/  本地 HTTP 服务
 panel/    面板与 xterm vendor
 mcp/      MCP stdio 服务
 scripts/  sync / singbox / sub2port / recycle / keepalive
-tests/    node:test（252）
+tests/    node:test（279）
 docs/     分析、报告、Canvas 文档</pre></div>
       <div class="card"><h3>发布检查单</h3><ul>
         <li><code>npm test</code> 全绿。</li>
@@ -1172,7 +1176,7 @@ docs/     分析、报告、Canvas 文档</pre></div>
   var now = new Date();
   var text = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0') +
     ' ' + String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
-  generated.textContent = '生成时间：' + text + ' · v1.7.0';
+  generated.textContent = '生成时间：' + text + ' · v1.8.0';
 })();
 </script>
 </body>
