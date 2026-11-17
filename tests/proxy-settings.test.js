@@ -36,7 +36,7 @@ test('proxy settings keep valid node URIs and drop junk', () => {
   assert.deepEqual(settings.ports, { good: 25001 });
 });
 
-test('singbox-up --dry-run maps every alias to a configurable port', () => {
+test('singbox-up --dry-run maps every alias to its matrix slot', () => {
   const dir = tempDir();
   const statePath = path.join(dir, 'state.json');
   fs.writeFileSync(statePath, JSON.stringify({
@@ -46,7 +46,7 @@ test('singbox-up --dry-run maps every alias to a configurable port', () => {
         enabled: true,
         basePort: 24001,
         size: 10,
-        ports: { alpha: 25001 },
+        ports: { alpha: 24100 },
         nodes: {
           alpha: 'vless://u1@1.1.1.1:443?security=tls&sni=a.example#A',
           beta: 'trojan://p2@2.2.2.2:443?security=tls&sni=b.example#B',
@@ -60,7 +60,39 @@ test('singbox-up --dry-run maps every alias to a configurable port', () => {
   });
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
-  assert.deepEqual(parsed.ports, { alpha: 25001, beta: 24002 });
+  assert.equal(parsed.mode, 'delegated');
+  assert.deepEqual(parsed.ports, { alpha: 24100, beta: 24002 });
+  assert.deepEqual(parsed.slots.map((slot) => slot.matrixSlotId), ['slot-100', 'slot-002']);
+  assert.equal(parsed.nodes, 2);
+});
+
+test('singbox-up --dry-run standalone fallback keeps the local port map', () => {
+  const dir = tempDir();
+  const statePath = path.join(dir, 'state.json');
+  fs.writeFileSync(statePath, JSON.stringify({
+    version: 1,
+    settings: {
+      proxy: {
+        enabled: true,
+        basePort: 25001,
+        size: 10,
+        ports: { alpha: 25011 },
+        nodes: {
+          alpha: 'vless://u1@1.1.1.1:443?security=tls&sni=a.example#A',
+          beta: 'trojan://p2@2.2.2.2:443?security=tls&sni=b.example#B',
+        },
+      },
+    },
+  }));
+  const result = spawnSync(
+    process.execPath,
+    ['scripts/singbox-up.js', '--state', statePath, '--dry-run', '--standalone-fallback'],
+    { cwd: ROOT, encoding: 'utf8' },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.mode, 'standalone');
+  assert.deepEqual(parsed.ports, { alpha: 25011, beta: 25002 });
   assert.equal(parsed.nodes, 2);
 });
 

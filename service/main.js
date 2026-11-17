@@ -14,6 +14,9 @@ const { createNetProbe } = require('../lib/netprobe');
 const inventory = require('../lib/inventory');
 const { createTerminalManager } = require('../lib/terminal');
 const { createAccountProxy } = require('../lib/account-proxy');
+const { createEgressClient } = require('../lib/egress-client');
+const { createEgressLeaseSync } = require('../lib/leases');
+const { createCfBridge } = require('../lib/cf-bridge');
 const { createRateLimiter } = require('../lib/ratelimit');
 const { createScheduler } = require('../lib/scheduler');
 const selfUpdate = require('../lib/self-update');
@@ -38,15 +41,45 @@ if (!PORT || !TOKEN) {
   process.exit(1);
 }
 
-const proxies = createAccountProxy({ getState: () => store.load(), log });
+const egress = createEgressClient({
+  baseUrl: process.env.OPENCHAMBER_EGRESS_BUS_URL || undefined,
+  log,
+});
+const cfBridge = createCfBridge({
+  baseUrl: process.env.OPENCHAMBER_CF_BRIDGE_URL || undefined,
+  log,
+});
+const proxies = createAccountProxy({ getState: () => store.load(), log, egress });
+const leaseSync = createEgressLeaseSync({ egress, getState: () => store.load(), log });
+const cfTunnels = new Map();
 const rateLimiter = createRateLimiter();
-const jobs = createJobs();
+const jobs = createJobs({
+  gate: async (job) => {
+    const alias = String((job.meta && job.meta.alias) || '');
+    if (!alias) return;
+    const outcome = await proxies.waitForResume(alias, { timeoutMs: 60000 });
+    if (outcome && outcome.ok === false && outcome.timeout) {
+      throw new InstaboxError('egress 槽位正在换血，命令已取消', {
+        code: 'egress_rotation_timeout',
+        status: 503,
+      });
+    }
+  },
+});
 const recycler = createRecycler({
   getState: () => store.load(),
-  saveStatus: (patch) => store.update((state) => {
-    store.upsertRecycleStatus(state, patch);
-    return true;
-  }),
+  saveStatus: (patch) => {
+    const saved = store.update((state) => {
+      store.upsertRecycleStatus(state, patch);
+      return true;
+    });
+    if (patch && patch.status === 'idle' && patch.account && patch.machineId) {
+      void autoProvisionTunnel(patch.account, patch.machineId).catch((error) => {
+        log(`CF 自动打通失败 ${patch.account}/${patch.machineId}: ${error.message}`);
+      });
+    }
+    return saved;
+  },
   directClientFor: (alias) => controlClientFor(alias),
   proxyClientFor: (alias) => controlClientFor(alias),
   lockPath: path.join(store.DATA_DIR, 'recycle.lock'),
@@ -56,7 +89,7 @@ const keepalive = createKeepalive({
   log,
   rateLimiter,
   clientFor: (alias) => clientForAccount(store.findAccount(store.load(), alias), store.load()),
-  isBusy: (account, machineId) => recycler.isBusy(account, machineId),
+  isBusy: (account, machineId) => recycler.isBusy(account, machineId) || proxies.isPaused(account),
 });
 const netprobe = createNetProbe();
 const terminals = createTerminalManager({ log });
@@ -206,6 +239,68 @@ async function probeBatch(targets, force) {
   await Promise.all(workers);
 }
 
+function matrixViewFor(alias) {
+  let target = null;
+  try { target = proxies.slotFor(alias); } catch { target = null; }
+  if (!target) return null;
+  const cached = target.matrixSlotId ? egress.cachedSlot(target.matrixSlotId) : null;
+  return {
+    matrixSlotId: target.matrixSlotId || null,
+    egressPort: target.egressPort,
+    routingPlane: target.routingPlane,
+    healthState: proxies.isPaused(alias) ? 'ROTATING' : (cached ? cached.healthState : 'ACTIVE'),
+    egressFingerprint: cached ? cached.egressFingerprint : null,
+    exitIp: cached && cached.egressFingerprint ? cached.egressFingerprint.exitIp : '',
+    ipv6Prefix64: cached && cached.egressFingerprint ? cached.egressFingerprint.ipv6Prefix64 : '',
+  };
+}
+
+function tunnelHostname(state, alias, machineId) {
+  const tunnels = (state.settings && state.settings.proxy && state.settings.proxy.tunnels) || {};
+  const explicit = tunnels[machineId];
+  if (explicit && explicit.hostname) return String(explicit.hostname);
+  const suffix = String(
+    (state.settings && state.settings.cf && state.settings.cf.hostnameSuffix)
+    || process.env.OPENCHAMBER_CF_HOSTNAME_SUFFIX
+    || '',
+  ).replace(/^\.+/, '').replace(/\.+$/, '');
+  if (!suffix) return '';
+  const label = `${alias}-${machineId}`
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return label ? `${label}.${suffix}` : '';
+}
+
+async function autoProvisionTunnel(alias, machineId) {
+  const state = store.load();
+  const account = store.findAccount(state, alias);
+  if (!account) return null;
+  let target = null;
+  try { target = proxies.slotFor(alias); } catch { target = null; }
+  if (!target || !target.matrixSlotId) return null;
+  const hostname = tunnelHostname(state, alias, machineId);
+  if (!hostname) return null;
+  const client = controlClientFor(alias);
+  if (!client) return { ok: false, alias, machineId, error: 'proxy_unavailable' };
+  const outcome = await cfBridge.provisionMachine(client, machineId, {
+    matrixSlotId: target.matrixSlotId,
+    hostname,
+    account: alias,
+    routingPlane: target.routingPlane,
+  });
+  cfTunnels.set(`${alias}/${machineId}`, {
+    ok: outcome.ok !== false,
+    machineId,
+    matrixSlotId: outcome.matrixSlotId || target.matrixSlotId,
+    hostname: outcome.hostname || hostname,
+    tunnelId: outcome.tunnelId || '',
+    cloudflared: outcome.cloudflared || 'unknown',
+    at: Date.now(),
+  });
+  return outcome;
+}
+
 async function overview(state, requested) {
   const accounts = selectedAccounts(state, requested);
   const results = await Promise.all(accounts.map(async (account) => {
@@ -227,6 +322,8 @@ async function overview(state, requested) {
           connection,
           keepalive: keepaliveFor(state, account.alias, machine.id),
           network: netprobe.get(account.alias, machine.id),
+          matrix: matrixViewFor(account.alias),
+          cf: cfTunnels.get(`${account.alias}/${machine.id}`) || null,
         });
       }));
       return { alias: account.alias, ok: true, usage, snapshots, machines: enriched };
@@ -675,6 +772,102 @@ async function route(req, res, url) {
     return send(res, 200, await overview(store.load(), query.account || ''));
   }
 
+  if (method === 'GET' && path === '/api/matrix/status') {
+    return send(res, 200, {
+      ok: true,
+      proxy: proxies.status(),
+      egress: egress.status(),
+      leases: leaseSync.status(),
+      tunnels: [...cfTunnels.entries()].map(([key, value]) => ({ key, ...value })),
+      cf: { baseUrl: cfBridge.baseUrl },
+    });
+  }
+
+  if (method === 'GET' && path === '/api/matrix/slots') {
+    const [slotsResult, leasesResult] = await Promise.allSettled([egress.slots(), egress.leases()]);
+    const reachable = slotsResult.status === 'fulfilled';
+    return send(res, 200, {
+      ok: true,
+      reachable,
+      error: reachable ? undefined : String(slotsResult.reason && slotsResult.reason.message),
+      slots: reachable ? slotsResult.value : [],
+      leases: leasesResult.status === 'fulfilled' ? leasesResult.value : [],
+      accounts: proxies.status(),
+    });
+  }
+
+  if (method === 'POST' && path === '/api/matrix/sync') {
+    return send(res, 200, { ok: true, ...(await leaseSync.sync()) });
+  }
+
+  if (method === 'POST' && path === '/api/matrix/bind') {
+    const body = await readBody(req);
+    const alias = String(body.alias || body.account || '');
+    if (!alias) throw new InstaboxError('缺少 alias', { code: 'missing_alias', status: 400 });
+    return send(res, 200, { ok: true, result: await leaseSync.bind(alias, body) });
+  }
+
+  if (method === 'POST' && path === '/api/matrix/rotate') {
+    const body = await readBody(req);
+    const alias = String(body.alias || body.account || '');
+    let target = null;
+    try { target = proxies.slotFor(alias); } catch { target = null; }
+    if (!target || !target.matrixSlotId) {
+      throw new InstaboxError(`账号 ${alias || '(空)'} 没有矩阵槽位`, {
+        code: 'matrix_slot_missing',
+        status: 409,
+      });
+    }
+    const result = await egress.rotateSlot(
+      target.matrixSlotId,
+      body.reason ? { reason: String(body.reason) } : {},
+    );
+    return send(res, 202, { ok: true, matrixSlotId: target.matrixSlotId, result });
+  }
+
+  if (method === 'GET' && path === '/api/cf/status') {
+    return send(res, 200, { ok: true, ...(await cfBridge.status()) });
+  }
+
+  if (method === 'POST' && path === '/api/cf/tunnel/provision') {
+    const body = await readBody(req);
+    const alias = String(body.alias || body.account || query.account || '');
+    const machineId = String(body.machineId || '');
+    if (!machineId) throw new InstaboxError('缺少 machineId', { code: 'missing_machine_id', status: 400 });
+    if (body.hostname) {
+      await store.update((state) => {
+        state.settings.proxy = store.normalizeProxySettings(state.settings.proxy);
+        state.settings.proxy.tunnels[machineId] = { hostname: String(body.hostname) };
+        return true;
+      });
+    }
+    const outcome = await autoProvisionTunnel(alias, machineId);
+    if (!outcome) {
+      throw new InstaboxError('CF 桥接未配置（缺少 hostnameSuffix 或矩阵槽位）', {
+        code: 'cf_unavailable',
+        status: 409,
+      });
+    }
+    return send(res, 202, { ok: true, tunnel: outcome });
+  }
+
+  if (method === 'POST' && path === '/api/cf/tunnel/teardown') {
+    const body = await readBody(req);
+    const alias = String(body.alias || body.account || query.account || '');
+    const machineId = String(body.machineId || '');
+    if (!machineId) throw new InstaboxError('缺少 machineId', { code: 'missing_machine_id', status: 400 });
+    const client = controlClientFor(alias);
+    if (!client) throw new InstaboxError('该账号没有可用代理，已拒绝直连', { code: 'proxy_unavailable', status: 503 });
+    let target = null;
+    try { target = proxies.slotFor(alias); } catch { target = null; }
+    const outcome = await cfBridge.teardownMachine(client, machineId, {
+      hostname: String(body.hostname || ''),
+      matrixSlotId: target && target.matrixSlotId ? target.matrixSlotId : String(body.matrixSlotId || ''),
+    });
+    cfTunnels.delete(`${alias}/${machineId}`);
+    return send(res, 200, { ok: true, tunnel: outcome });
+  }
+
   if (method === 'GET' && path === '/api/usage') {
     const state = store.load();
     const accounts = selectedAccounts(state, query.account || '');
@@ -1119,6 +1312,16 @@ async function route(req, res, url) {
       if (action === 'delete') {
         const confirm = String(body.confirm || '');
         if (!confirm) throw new InstaboxError('删除需要 confirm（机器 ID 或名称）', { code: 'confirm_required', status: 400 });
+        try {
+          let target = null;
+          try { target = proxies.slotFor(alias); } catch { target = null; }
+          await cfBridge.teardownMachine(client, machineId, {
+            matrixSlotId: target && target.matrixSlotId ? target.matrixSlotId : '',
+          });
+        } catch (error) {
+          log(`CF 隧道清理失败 ${alias}/${machineId}: ${error.message}`);
+        }
+        cfTunnels.delete(`${alias}/${machineId}`);
         const operation = await client.power(machineId, 'delete', { confirm });
         return send(res, 200, { ok: true, operation });
       }
@@ -1155,8 +1358,35 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+/*
+ * Rotation choreography: the egress matrix announces a freeze before it swaps
+ * an upstream. Every account bound to that slot stops issuing control-plane
+ * requests and its connection pools are torn down; ACK is sent by the client
+ * after these handlers resolve. Resume refreshes the fingerprint and reopens.
+ */
+function startEgressSubscription() {
+  egress.subscribe({
+    freeze: (record) => {
+      const paused = proxies.freezeSlot(record.matrixSlotId, record);
+      log(`egress 冻结 ${record.matrixSlotId}（${record.reason}），暂停 ${paused.length} 个账号`);
+    },
+    resume: ({ slot }) => {
+      const resumed = proxies.resumeSlot(slot.matrixSlotId, slot.egressFingerprint);
+      const exitIp = slot.egressFingerprint && slot.egressFingerprint.exitIp;
+      log(`egress 恢复 ${slot.matrixSlotId}${exitIp ? ` exit=${exitIp}` : ''}，恢复 ${resumed.length} 个账号`);
+    },
+    failed: (payload) => {
+      log(`egress 轮换失败 ${payload.matrixSlotId}: ${payload.reason || payload.error || 'unknown'}`);
+    },
+    slot: ({ slot }) => {
+      log(`egress 槽位更新 ${slot.matrixSlotId} -> ${slot.healthState}`);
+    },
+  });
+}
+
 server.listen(PORT, HOST, () => {
   log(`listening on ${HOST}:${PORT}`);
+  startEgressSubscription();
   keepalive.start();
   void keepalive.tick();
 });
@@ -1167,6 +1397,7 @@ function shutdown() {
   shuttingDown = true;
   keepalive.stop();
   terminals.closeAll();
+  egress.close();
   proxies.closeAll();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 2000).unref();

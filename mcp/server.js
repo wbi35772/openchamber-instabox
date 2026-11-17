@@ -10,6 +10,9 @@ const { createNetProbe } = require('../lib/netprobe');
 const inventory = require('../lib/inventory');
 const inventoryProbe = require('../lib/inventory-probe');
 const { createAccountProxy } = require('../lib/account-proxy');
+const contract = require('../core/contract');
+const { createEgressClient } = require('../lib/egress-client');
+const { createCfBridge } = require('../lib/cf-bridge');
 const { createRateLimiter } = require('../lib/ratelimit');
 const { createScheduler } = require('../lib/scheduler');
 const { machineUptime, cooldownInfo } = require('../lib/uptime');
@@ -112,7 +115,9 @@ async function resolveMachineId(api, value) {
 }
 
 const netprobe = createNetProbe();
-const proxies = createAccountProxy({ getState: () => store.load(), log });
+const egress = createEgressClient({ log });
+const cfBridge = createCfBridge({ log });
+const proxies = createAccountProxy({ getState: () => store.load(), log, egress });
 const rateLimiter = createRateLimiter();
 
 const recycler = createRecycler({
@@ -382,6 +387,33 @@ const TOOLS = [
       properties: {
         operation: { type: 'string', enum: ['status', 'release', 'probe'] },
         account: { type: 'string', description: 'Account alias; omit for all accounts on release, or the active account on probe.' },
+      },
+      required: ['operation'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'instabox_matrix_slot_status',
+    description: 'Show the fixed matrix slot (slot-001..slot-250 and 24001-24250) of every account, plus live egress health, lease id and exit fingerprint from the local egress bus when reachable.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account: { type: 'string', description: 'Account alias; omit for all enabled accounts.' },
+        live: { type: 'boolean', description: 'Query the egress bus for live slot state; default true.' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'instabox_provision_cf_tunnel',
+    description: 'Provision a Cloudflare Argo tunnel for one machine through the local CF bridge (127.0.0.1:19882) and start cloudflared inside the sandbox. Teardown stops it and releases the tunnel.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        operation: { type: 'string', enum: ['provision', 'teardown', 'status'] },
+        account: { type: 'string', description: 'Account alias; default the active account.' },
+        machine_id: { type: 'string', description: 'Sandbox ID or name.' },
+        hostname: { type: 'string', description: 'Public hostname; default from settings.proxy.tunnels or <alias>-<id>.<hostnameSuffix>.' },
       },
       required: ['operation'],
       additionalProperties: false,
@@ -1449,6 +1481,127 @@ async function recycleTool(args) {
   return fail(`未知 operation：${operation}`);
 }
 
+function tunnelHostnameFor(state, alias, machineId, explicit) {
+  const cf = (state.settings && state.settings.cf) || {};
+  const suffix = String(cf.hostnameSuffix || process.env.OPENCHAMBER_CF_HOSTNAME_SUFFIX || '').trim();
+  const configured = state.settings.proxy
+    && state.settings.proxy.tunnels
+    && state.settings.proxy.tunnels[machineId];
+  const direct = String(explicit || (configured && configured.hostname) || '').trim();
+  if (direct) return direct.toLowerCase();
+  if (!suffix) return '';
+  return `${alias}-${machineId}.${suffix}`.toLowerCase();
+}
+
+function matrixSlotStatusTool(args) {
+  const state = store.load();
+  const alias = String(args.account || '').trim();
+  const list = alias
+    ? [resolveAccount(state, alias)]
+    : state.accounts.filter((account) => account.enabled !== false);
+  const live = egress.status();
+  const accounts = list.map((account) => {
+    let target = null;
+    let error = null;
+    try {
+      target = proxies.slotFor(account.alias);
+    } catch (caught) {
+      error = caught.message;
+    }
+    const matrixSlotId = target && target.matrixSlotId ? target.matrixSlotId : '';
+    const cached = matrixSlotId ? egress.cachedSlot(matrixSlotId) : null;
+    const frozen = matrixSlotId ? egress.isFrozen(matrixSlotId) : false;
+    const fingerprint = contract.normalizeFingerprint(
+      (cached && cached.egressFingerprint) || {},
+      cached && cached.leaseId,
+    );
+    return {
+      alias: account.alias,
+      matrixSlotId: matrixSlotId || null,
+      egressPort: target ? target.egressPort : null,
+      routingPlane: target ? target.routingPlane : null,
+      healthState: frozen ? 'ROTATING' : (cached ? cached.healthState : 'UNKNOWN'),
+      frozen,
+      exitIp: fingerprint.exitIp || '',
+      ipv6Prefix64: fingerprint.ipv6Prefix64 || '',
+      leaseId: (cached && cached.leaseId) || fingerprint.leaseId || '',
+      error,
+    };
+  });
+  if (args.live === true) {
+    return egress.slots()
+      .then((slots) => ok(JSON.stringify({
+        ok: true,
+        bus: live.baseUrl,
+        connected: live.connected,
+        accounts,
+        slots,
+      }, null, 2)))
+      .catch((error) => ok(JSON.stringify({
+        ok: false,
+        bus: live.baseUrl,
+        connected: live.connected,
+        error: error.message,
+        accounts,
+      }, null, 2)));
+  }
+  return ok(JSON.stringify({
+    ok: true,
+    bus: live.baseUrl,
+    connected: live.connected,
+    frozenSlots: live.frozenSlots,
+    accounts,
+  }, null, 2));
+}
+
+async function cfTunnelTool(args) {
+  const operation = String(args.operation || 'status');
+  const state = store.load();
+  if (operation === 'status') {
+    const status = await cfBridge.status();
+    return ok(JSON.stringify({ ok: true, bridge: cfBridge.baseUrl, status }, null, 2));
+  }
+  const alias = String(args.account || '').trim();
+  const account = resolveAccount(state, alias);
+  const api = client(account, state);
+  const machineId = await resolveMachineId(api, String(args.machine_id || ''));
+  const explicit = String(args.hostname || '').trim();
+
+  if (operation === 'teardown') {
+    let target = null;
+    try { target = proxies.slotFor(account.alias); } catch { target = null; }
+    const outcome = await cfBridge.teardownMachine(api, machineId, {
+      hostname: explicit,
+      matrixSlotId: target && target.matrixSlotId ? target.matrixSlotId : '',
+    });
+    return ok(JSON.stringify({ ok: true, account: account.alias, ...outcome }, null, 2));
+  }
+
+  let target = null;
+  try {
+    target = proxies.slotFor(account.alias);
+  } catch (error) {
+    return fail(`账号 ${account.alias} 的矩阵槽位不可用：${error.message}`);
+  }
+  if (!target || !target.matrixSlotId) return fail(`账号 ${account.alias} 没有矩阵槽位`);
+  const hostname = tunnelHostnameFor(state, account.alias, machineId, explicit);
+  if (!hostname) {
+    return fail('缺少 hostname：请在参数中给出，或配置 settings.cf.hostnameSuffix / OPENCHAMBER_CF_HOSTNAME_SUFFIX');
+  }
+  await store.update((draft) => {
+    draft.settings.proxy = store.normalizeProxySettings(draft.settings.proxy);
+    draft.settings.proxy.tunnels[machineId] = { hostname };
+    return true;
+  });
+  const outcome = await cfBridge.provisionMachine(api, machineId, {
+    matrixSlotId: target.matrixSlotId,
+    hostname,
+    account: account.alias,
+    routingPlane: target.routingPlane,
+  });
+  return ok(JSON.stringify({ ok: true, account: account.alias, ...outcome }, null, 2));
+}
+
 async function callTool(name, args) {
   switch (name) {
     case 'instabox_list_machines': return listMachines(args);
@@ -1465,6 +1618,8 @@ async function callTool(name, args) {
     case 'instabox_list_accounts': return ok(accountList(store.load()));
     case 'instabox_proxy': return proxyTool(args);
     case 'matrix_tag': return matrixTagTool(args);
+    case 'instabox_matrix_slot_status': return matrixSlotStatusTool(args);
+    case 'instabox_provision_cf_tunnel': return cfTunnelTool(args);
     case 'matrix_exec_batch': return matrixExecBatch(args);
     case 'matrix_inventory_summary': return matrixInventorySummary(args);
     case 'instabox_files': return filesTool(args);

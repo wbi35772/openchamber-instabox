@@ -12,7 +12,7 @@
 ## 常用命令
 
 ```powershell
-npm test                       # node --test，全量 207 条
+npm test                       # node --test，全量 252 条
 node scripts/sync.mjs          # 同步到 %USERPROFILE%\.config\openchamber\extensions\instabox-matrix
 node scripts/sync.mjs --check  # 只比对，必须干净
 node scripts/docs-canvas.js    # 重新发布 docs/canvas 全景文档到 Canvas
@@ -43,6 +43,8 @@ node scripts/keepalive-tick.js
 ## 已知边界
 
 - 浏览器 / SSH 外链由宿主打开，不经过 Node 代理，不在零直连范围内。
-- 端口当前按 alias 排序槽位计算（`basePort + index % size`），新增账号可能造成漂移；粘性端口表与 SQLite 是下一阶段（v1.7.0）。
+- 账号槽位固定 `slot-001`~`slot-250`（端口 24001–24250）；新账号优先用 `settings.proxy.slots[alias]` 固定，未固定时按排序索引 +1，超出 250 抛 `matrix_slot_exhausted`。
+- 排障：面板无机器先查槽位是否 `UNKNOWN`。`settings.proxy.ports[alias]` 落在 24001–24250 会按端口反推槽位，与 bus 实际槽位不一致时所有请求 503；用 `settings.proxy.slots[alias]` 固定到 bus 上 ACTIVE 的槽位，改完刷新面板即可（服务每请求重读状态）。
+- 出口与换血由 `openchamber-egress-matrix`（127.0.0.1:19880）负责，CF 隧道由 `openchamber-cloudflare`（127.0.0.1:19882）负责；两者都不可达时按 fail-closed 处理，不做直连回退。
 - Canvas 访客页运行在 `sandbox allow-scripts`，链接必须用 `data-open` + `location.href` 自导航，不能用 `target=_blank`。
 - 机器 Canvas 复用 artifact 追加版本；目标站点 `X-Frame-Options: DENY` 时只能复制到浏览器打开。

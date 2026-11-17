@@ -1,5 +1,21 @@
 # 变更记录
 
+## 1.7.0 — 2026-11-16
+
+Egress Matrix T0：出口管理移交 `openchamber-egress-matrix`（127.0.0.1:19880），实例打通 `openchamber-cloudflare` Argo Tunnel（127.0.0.1:19882）。
+
+- 新增 `core/contract.js`：与 egress / cloudflare 扩展字段 100% 对齐（slot-001~250、24001~24250、STRICT_CONTROL/ELASTIC_DATA、healthState、egressFingerprint、`BLOCKED_HEALTH_STATES`）。
+- 新增 `lib/egress-client.js`：19880 HTTP/WS 客户端，租约绑定、槽位探测、换血冻结 ACK、重连与状态缓存。
+- 槽位固定：`settings.proxy.slots[alias]` → 矩阵端口推导 → 排序索引+1；>250 抛 `matrix_slot_exhausted`。
+- 双平面路由：控制面请求注入 `X-OC-Routing-Plane: STRICT_CONTROL` 与 `Proxy-Authorization: Basic base64("<slot>:STRICT_CONTROL")`。
+- 发包前核验槽位实时状态；`QUARANTINED` / `WARP_OVERFLOW` / `ROTATING` fail-closed，零直连。
+- 订阅 egress WS：`PRE_ROTATION_FREEZE` 暂停槽位 keepalive/jobs、销毁连接池并 `ack-freeze`；`POST_ROTATION_RESUME` 刷新指纹并恢复。
+- `lib/sub2port.js`、`scripts/singbox-up.js`、`scripts/sub2port-serve.js` 默认委托 19880 租约，仅 `--standalone-fallback` 启用本地 sing-box。
+- 新增 `lib/cf-bridge.js`：实例 RUNNING 后 `POST /api/v1/cf/tunnel/provision` 并在实例内拉起 `cloudflared tunnel run --token`；销毁时 `teardown`。token 不进入状态、日志或响应。
+- MCP 新增 `instabox_provision_cf_tunnel`、`instabox_matrix_slot_status`（共 19 个工具）。
+- 面板：顶栏 `OC // INSTABOX-MATRIX`、EGRESS / CLOUDFLARE 状态灯、实例计数、批量保活/回收/同步 Egress；卡片显示槽位/端口、exitIp+/64、publicHostname、双轨进度条。
+- 新增 44 条测试（合约、egress client、门禁、CF 桥接、sub2port 委托），总计 252 条通过。
+
 ## 1.6.0 — 2026-11-15
 
 零直连传输层，仓库迁移为私有的 `openchamber-instabox`。

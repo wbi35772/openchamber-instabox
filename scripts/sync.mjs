@@ -15,7 +15,7 @@ const COPY_FILES = [
   'scripts/recycle.js',
   'scripts/install-recycle-task.ps1',
 ];
-const COPY_DIRS = ['lib', 'service', 'mcp', 'panel'];
+const COPY_DIRS = ['core', 'lib', 'service', 'mcp', 'panel'];
 
 function usage() {
   console.log([

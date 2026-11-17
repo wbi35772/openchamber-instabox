@@ -1,6 +1,6 @@
 # OpenChamber Instabox
 
-> 私有仓库：`wbi35772/openchamber-instabox` · 扩展 ID：`instabox-matrix` · v1.6.0
+> 私有仓库：`wbi35772/openchamber-instabox` · 扩展 ID：`instabox-matrix` · v1.7.0
 >
 > 仓库名是 `openchamber-instabox`；为保持已安装扩展、状态目录和 MCP 配置兼容，扩展 ID 与 `~/.openchamber-instabox-matrix` 数据目录保持不变。
 >
@@ -11,7 +11,10 @@ OpenChamber 的多账号 Instabox 机器矩阵扩展：一个面板管理多个�
 ## 核心特性
 
 - **零直连出口**：REST、凭证测试、回收控制面、keepalive 租约与终端 WebSocket 全部绑定 per-alias 代理；无端口抛 `ERR_PROXY_REQUIRED_FAIL_CLOSED`（503），不回退 `globalThis.fetch`。
-- **多账号矩阵**：每账号一行，按 alias 路由；机器卡片展示状态、规格、数据盘、uptime、最长运行与冷却时间。
+- **Egress Matrix 委托**：出口槽位、租约与换血交给 `openchamber-egress-matrix`（127.0.0.1:19880）。账号固定 `matrixSlotId` + `egressPort`（24001–24250），控制面注入双平面头；发包前核验槽位，`QUARANTINED` / `WARP_OVERFLOW` / `ROTATING` 立即 fail-closed。
+- **换血冻结**：订阅 egress WS，`PRE_ROTATION_FREEZE` 暂停该槽 keepalive/jobs 并销毁连接池、回 `ack-freeze`；`POST_ROTATION_RESUME` 刷新指纹后恢复。
+- **Cloudflare Tunnel**：实例 RUNNING 后经 `openchamber-cloudflare`（127.0.0.1:19882）provision 隧道，并在实例内拉起 `cloudflared tunnel run`；销毁时 teardown。token 只经一次 `noHistory` exec 注入，不落状态与日志。
+- **多账号矩阵**：每账号一行，按 alias 路由；机器卡片展示状态、规格、数据盘、uptime、最长运行与冷却时间，以及槽位/端口、exitIp+/64、publicHostname。
 - **机器操作**：启动、停止、暂停、恢复、重启、删除（名称确认）、从模板创建与克隆（等待 operation）。
 - **活动租约**：自动续租；空闲暂停后由 exec / 终端流量唤醒；可选冷却唤醒 `wake → resume → start`。
 - **自动回收**：lead = maxRun 10%（clamp 10–30 分钟），`suspend → resume → verify`，失败 bootstrap 一次后降级。
@@ -23,7 +26,7 @@ OpenChamber 的多账号 Instabox 机器矩阵扩展：一个面板管理多个�
 - **Web 终端**：xterm 轮询、输入/缩放、持久 shell、重连回放；WSS 经账号代理。
 - **服务清单**：监听端口、Docker、systemd，以及 `/etc/instabox-apps.json` 应用地址与凭据。
 - **机器 Canvas**：把机器状态、SSH、公网入口、应用凭据、端口与服务发布为版本化 artifact。
-- **MCP**：17 个工具，覆盖机器、执行、文件、快照、网络、SSH、桌面、代理与回收。
+- **MCP**：19 个工具，覆盖机器、执行、文件、快照、网络、SSH、桌面、代理、矩阵槽位、CF 隧道与回收。
 
 ## 安装
 
@@ -48,13 +51,18 @@ node scripts/sync.mjs --check
 
 ```text
 settings.proxy.enabled = true    # 必须配置端口，否则 fail-closed
-settings.proxy.basePort = 24001  # port = basePort + aliasIndex % size
+settings.proxy.slots[alias]      # 固定 matrixSlotId，优先级最高
+settings.proxy.basePort = 24001  # 未固定时：排序索引 + 1 → 24001..24250
 settings.proxy.size = 250
-settings.proxy.ports[alias]      # 显式端口优先
+settings.proxy.ports[alias]      # 兼容旧配置；矩阵内端口推导出槽位
+settings.proxy.tunnels[machineId].hostname  # 可选，CF provision 指定域名
 ```
 
+出口委派给 `openchamber-egress-matrix`（默认 `http://127.0.0.1:19880`，`OPENCHAMBER_EGRESS_BUS_URL` 可覆盖）。未启动总线时槽位核验失败即 fail-closed；sub2port 只有在 `--standalone-fallback` 时才回到本地 sing-box。
+
 ```powershell
-node scripts/singbox-up.js       # 按 alias 生成 sing-box 配置并启动
+node scripts/singbox-up.js       # 默认向 19880 申请槽位租约
+node scripts/sub2port-serve.js   # 同上；--standalone-fallback 启用本地引擎
 node scripts/recycle.js --dry-run
 node scripts/keepalive-tick.js
 ```
@@ -107,28 +115,33 @@ MCP 直接读取状态文件并访问 Instabox API，不依赖面板或本地 HT
 | `instabox_ssh_token` | list / create / revoke / revoke_all |
 | `instabox_desktop` | status / install / start / takeover / handback / stream / stream_state / stream_revoke |
 | `instabox_recycle` | status / set / run |
+| `instabox_matrix_slot_status` | 查询 egress 槽位、租约与冻结状态（可触发探测） |
+| `instabox_provision_cf_tunnel` | 为运行中实例 provision Cloudflare Tunnel 并拉起 cloudflared |
 
 ## 面板
 
-机器详情 9 个 tab：概览、服务、访问、文件、终端、指标、日志、历史、进程。切换或关闭会停止轮询并清理终端会话。
+机器详情 9 个 tab：概览、服务、访问、文件、终端、指标、日志、历史、进程。切换或关闭会停止轮询并清理终端会话与浏览器会话。
+
+顶栏显示 `OC // INSTABOX-MATRIX`、EGRESS 与 CLOUDFLARE 状态灯、实例计数，以及批量保活 / 回收 / 同步 Egress 按钮。卡片额外显示槽位与端口、exitIp + /64、publicHostname 和双轨（控制面 / 数据面）进度条。
 
 机器 Canvas 会把状态、SSH、公网入口、应用清单（含账号密码）、监听端口、容器、systemd、保活与回收信息发布为 artifact；同一机器复用 artifact 并追加版本，密码默认掩码。Canvas 访客页运行在沙箱中，链接改为画布内导航；目标站点返回 `X-Frame-Options: DENY` 时需复制到浏览器打开。
 
 ## 开发
 
 ```powershell
-npm test                      # 207 条测试
+npm test                      # 252 条测试
 node scripts/sync.mjs --check # 安装副本对齐
 node scripts/docs-canvas.js   # 重新发布全景文档
 ```
 
 ```text
-lib/       平台客户端与通用模块（22 个）
+lib/       平台客户端与通用模块（24 个）
+core/      统一合约 contract.js（与 egress / cloudflare 对齐）
 service/   本地 HTTP 服务（127.0.0.1）
 panel/     面板（IIFE + xterm vendor）
-mcp/       MCP stdio 服务（17 个工具）
-scripts/   sync / singbox / recycle / keepalive / docs-canvas
-tests/     node:test（35 个文件，207 条）
+mcp/       MCP stdio 服务（19 个工具）
+scripts/   sync / singbox / sub2port / recycle / keepalive / docs-canvas
+tests/     node:test（40 个文件，252 条）
 docs/      analysis / reports / canvas / plans / specs
 ```
 
@@ -148,7 +161,7 @@ docs/      analysis / reports / canvas / plans / specs
 - 活动租约不能延长最长连续运行时间；到点进入冷却。
 - 终端为轮询实现，单用户单会话，空闲 2 分钟回收。
 - 浏览器链接与 SSH 链接由宿主打开，不经过 Node 代理；Node 侧 REST 与 WSS 强制走代理。
-- 超过 250 个账号时端口会重叠，需要粘性端口映射（v1.7.0）。
+- 账号上限 250：矩阵槽位固定 `slot-001`~`slot-250`，端口 24001–24250；超出抛 `matrix_slot_exhausted`。新增账号建议用 `settings.proxy.slots[alias]` 固定槽位，避免排序漂移。
 
 ## License
 
