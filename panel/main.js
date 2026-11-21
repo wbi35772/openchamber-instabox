@@ -390,6 +390,19 @@
     modal: null,
     modalBusy: false,
     templatesByAccount: {},
+    accountView: '',
+    accountFilter: '',
+    accountLimit: 80,
+    accountsCollapsed: false,
+    overviewCache: {},
+    overviewCacheAt: {},
+    lastBootstrapAt: 0,
+    refreshSeq: 0,
+    railCollapsed: false,
+    railWidth: 260,
+    activeGroup: '',
+    groups: [],
+    groupDraft: null,
   };
 
   var gridEl = null;
@@ -457,43 +470,202 @@
     }
   }
 
+  function cacheOverview(account, data) {
+    state.overviewCache[account] = data;
+    state.overviewCacheAt[account] = Date.now();
+    var keys = Object.keys(state.overviewCache);
+    if (keys.length > 12) {
+      keys.sort(function (a, b) { return (state.overviewCacheAt[a] || 0) - (state.overviewCacheAt[b] || 0); });
+      while (keys.length > 12) {
+        var stale = keys.shift();
+        delete state.overviewCache[stale];
+        delete state.overviewCacheAt[stale];
+      }
+    }
+  }
+
+  async function refreshAux(ticket) {
+    try {
+      var tasks = [
+        service('GET', '/api/matrix/status', { timeoutMs: 8000 }).catch(function () { return null; }),
+        service('GET', '/api/cf/status', { timeoutMs: 6000 }).catch(function () { return null; }),
+      ];
+      var needBootstrap = !state.accounts.length || Date.now() - state.lastBootstrapAt > 60000;
+      if (needBootstrap) {
+        tasks.push(service('GET', '/api/bootstrap', { timeoutMs: 15000 }).catch(function () { return null; }));
+      }
+      var results = await Promise.all(tasks);
+      if (ticket !== state.refreshSeq) return;
+      state.matrix = results[0] || state.matrix;
+      state.cf = results[1] || state.cf;
+      if (needBootstrap) {
+        var accountList = results[2];
+        if (accountList) {
+          state.accounts = accountList.accounts || state.accounts;
+          state.settings = accountList.settings || state.settings;
+          state.version = accountList.version || state.version;
+          state.lastBootstrapAt = Date.now();
+        }
+      }
+      renderAccounts();
+      renderStatusCluster();
+      syncSelect();
+      await probeBusHealth().catch(function () { return null; });
+      if (ticket === state.refreshSeq) renderStatusCluster();
+    } catch (error) {
+      /* background enrichment never blocks the grid */
+    }
+  }
+
+  function readPref(key, fallback) {
+    try {
+      var value = window.localStorage.getItem(key);
+      return value === null ? fallback : value;
+    } catch (error) {
+      return fallback;
+    }
+  }
+
+  function writePref(key, value) {
+    try { window.localStorage.setItem(key, value); } catch (error) { /* ignore */ }
+  }
+
+  var GROUPS_KEY = 'o2a.accounts.groups';
+
+  function loadGroups() {
+    try {
+      var raw = window.localStorage.getItem(GROUPS_KEY);
+      if (!raw) return [];
+      var parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter(function (group) {
+        return group && typeof group.id === 'string' && Array.isArray(group.accounts);
+      }).map(function (group) {
+        return {
+          id: group.id,
+          name: String(group.name || '未命名分组'),
+          accounts: group.accounts.filter(function (alias) { return typeof alias === 'string'; }),
+        };
+      });
+    } catch (error) {
+      return [];
+    }
+  }
+
+  function saveGroups() {
+    writePref(GROUPS_KEY, JSON.stringify(state.groups));
+  }
+
+  function groupById(id) {
+    if (!id) return null;
+    return state.groups.find(function (group) { return group.id === id; }) || null;
+  }
+
+  function newGroupId() {
+    return 'g' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  }
+
+  function groupAliases(group) {
+    if (!group) return [];
+    var known = {};
+    state.accounts.forEach(function (account) { known[account.alias] = true; });
+    return group.accounts.filter(function (alias) { return known[alias]; });
+  }
+
+  function scopeKey() {
+    if (state.activeGroup) return 'g:' + state.activeGroup;
+    return state.selected || 'all';
+  }
+
+  async function fetchScopedOverview(scope) {
+    if (scope && scope.indexOf('g:') === 0) {
+      var group = groupById(scope.slice(2));
+      var aliases = groupAliases(group);
+      if (!aliases.length) return { ok: true, accounts: [], fetchedAt: Date.now() };
+      var allowed = {};
+      aliases.forEach(function (alias) { allowed[alias] = true; });
+      var all = await service('GET', '/api/overview', { query: { account: 'all' }, timeoutMs: 45000 });
+      var accounts = (all.accounts || []).filter(function (account) { return allowed[account.alias]; });
+      return { ok: true, accounts: accounts, fetchedAt: all.fetchedAt || Date.now() };
+    }
+    if (!scope || scope === 'all') {
+      return service('GET', '/api/overview', { query: { account: 'all' }, timeoutMs: 45000 });
+    }
+    return service('GET', '/api/overview', { query: { account: scope }, timeoutMs: 45000 });
+  }
+
   async function refresh(options) {
     var opts = options || {};
-    if (state.refreshing) return;
+    var scope = scopeKey();
+    if (state.refreshing && !opts.force) return;
+    var ticket = (state.refreshSeq += 1);
     state.refreshing = true;
     if (!opts.silent && !state.overview) {
       state.loading = true;
       render();
     }
+    var failed = false;
     try {
-      var data = await service('GET', '/api/overview', {
-        query: { account: state.selected },
-        timeoutMs: 90000,
-      });
+      var data = await fetchScopedOverview(scope);
+      if (ticket !== state.refreshSeq || scope !== scopeKey()) return;
       state.overview = data;
+      cacheOverview(scope, data);
       state.lastRefresh = Date.now();
-      if (!opts.silent) state.error = null;
-      else if (state.error && state.error.code !== 'NO_SERVICE') state.error = null;
-      var accountList = await service('GET', '/api/bootstrap', { timeoutMs: 20000 }).catch(function () { return null; });
-      if (accountList) {
-        state.accounts = accountList.accounts || state.accounts;
-        state.settings = accountList.settings || state.settings;
-        state.version = accountList.version || state.version;
-      }
-      var pair = await Promise.all([
-        service('GET', '/api/matrix/status', { timeoutMs: 8000 }).catch(function () { return null; }),
-        service('GET', '/api/cf/status', { timeoutMs: 6000 }).catch(function () { return null; }),
-      ]);
-      state.matrix = pair[0] || state.matrix;
-      state.cf = pair[1] || state.cf;
-      await probeBusHealth().catch(function () { return null; });
+      state.error = null;
     } catch (error) {
-      state.error = error;
+      if (ticket !== state.refreshSeq) return;
+      if (scope === scopeKey()) {
+        state.error = error;
+        failed = true;
+      }
     } finally {
-      state.refreshing = false;
-      state.loading = false;
-      render();
+      if (ticket === state.refreshSeq) {
+        state.refreshing = false;
+        state.loading = false;
+        render();
+      }
     }
+    if (ticket === state.refreshSeq && !failed) void refreshAux(ticket);
+  }
+
+  function selectAccount(alias) {
+    var next = alias || 'all';
+    var hadGroup = Boolean(state.activeGroup);
+    state.activeGroup = '';
+    if (hadGroup) writePref('o2a.rail.group', '');
+    if (state.selected === next && !hadGroup) {
+      refresh({ force: true, silent: true });
+      return;
+    }
+    state.selected = next;
+    state.refreshSeq += 1;
+    state.refreshing = false;
+    state.error = null;
+    var cached = state.overviewCache[scopeKey()] || null;
+    state.overview = cached;
+    state.loading = !cached;
+    render();
+    refresh({ force: true, silent: Boolean(cached) });
+  }
+
+  function selectGroup(id) {
+    var next = id && groupById(id) ? id : '';
+    if (state.activeGroup === next) {
+      refresh({ force: true, silent: true });
+      return;
+    }
+    state.activeGroup = next;
+    if (next) state.selected = 'all';
+    writePref('o2a.rail.group', next);
+    state.refreshSeq += 1;
+    state.refreshing = false;
+    state.error = null;
+    state.accountLimit = 80;
+    var cached = state.overviewCache[scopeKey()] || null;
+    state.overview = cached;
+    state.loading = !cached;
+    render();
+    refresh({ force: true, silent: Boolean(cached) });
   }
 
   function machinesOf(overview) {
@@ -539,10 +711,21 @@
   }
 
   async function runMatrixKeepalive() {
+    var scopeAccounts = null;
+    if (state.activeGroup) {
+      scopeAccounts = groupAliases(groupById(state.activeGroup));
+      if (!scopeAccounts.length) { toast('这个分组还没有账号'); return; }
+    } else if (state.selected && state.selected !== 'all') {
+      scopeAccounts = [state.selected];
+    }
+    var label = scopeAccounts ? (scopeAccounts.length + ' 个账号') : '全部账号';
     try {
-      var result = await service('POST', '/api/keepalive/tick', { body: {}, timeoutMs: 90000 });
+      var result = await service('POST', '/api/keepalive/tick', {
+        body: scopeAccounts ? { accounts: scopeAccounts } : {},
+        timeoutMs: 90000,
+      });
       var patches = (result && result.patches) || [];
-      toast('保活已下发：' + patches.length + ' 台更新', 'ok');
+      toast('保活已下发（' + label + '）：' + patches.length + ' 台更新', 'ok');
       refresh({ silent: true });
     } catch (error) {
       toast('保活失败：' + describeError(error), 'error');
@@ -616,49 +799,211 @@
     var select = $('#account-select');
     if (!select) return;
     var wanted = ['all'].concat(state.accounts.map(function (a) { return a.alias; }));
-    var current = select.value;
-    var options = ['<option value="all">全部账号</option>'].concat(
-      state.accounts.map(function (a) {
-        return '<option value="' + esc(a.alias) + '">' + esc(a.alias) + '</option>';
-      }),
-    );
-    select.innerHTML = options.join('');
-    select.value = wanted.indexOf(current) >= 0 ? current : (wanted.indexOf(state.selected) >= 0 ? state.selected : 'all');
-    if (select.value !== state.selected && select.value) state.selected = select.value;
+    var groupSig = state.groups.map(function (g) { return g.id + ':' + g.name + ':' + g.accounts.length; }).join('\u0001');
+    var signature = wanted.join('\u0000') + '\u0002' + groupSig;
+    if (select.dataset.signature !== signature) {
+      var parts = ['<option value="all">全部账号</option>'];
+      if (state.groups.length) {
+        parts.push('<optgroup label="分组">');
+        state.groups.forEach(function (group) {
+          parts.push('<option value="g:' + esc(group.id) + '">' + esc(group.name) + '（' + groupAliases(group).length + '）</option>');
+        });
+        parts.push('</optgroup>');
+      }
+      parts.push('<optgroup label="账号">');
+      state.accounts.forEach(function (a) {
+        parts.push('<option value="' + esc(a.alias) + '">' + esc(a.alias) + '</option>');
+      });
+      parts.push('</optgroup>');
+      select.innerHTML = parts.join('');
+      select.dataset.signature = signature;
+      select.dataset.groups = groupSig;
+    }
+    if (state.activeGroup && groupById(state.activeGroup)) {
+      select.value = 'g:' + state.activeGroup;
+    } else {
+      if (state.activeGroup) state.activeGroup = '';
+      if (wanted.indexOf(state.selected) < 0) state.selected = 'all';
+      if (select.value !== state.selected) select.value = state.selected;
+    }
   }
 
-  function renderAccounts() {
-    if (!accountsEl) return;
-    if (!state.accounts.length) {
-      accountsEl.innerHTML = '';
-      return;
-    }
+  function setAccountView(view) {
+    if (['chips', 'list', 'table'].indexOf(view) < 0) return;
+    state.accountView = view;
+    state.accountLimit = 80;
+    writePref('o2a.accounts.view', view);
+    renderAccounts();
+  }
+
+  function accountMeta(account) {
+    var identity = account.identity || {};
+    var org = identity.org ? (identity.org.name || identity.org.id) : (identity.login || identity.email || '未验证');
+    return {
+      org: org,
+      needle: [account.alias, identity.login, identity.email, org, identity.org && identity.org.id].join(' ').toLowerCase(),
+    };
+  }
+
+  function accountCounts() {
     var counts = {};
     (state.overview && state.overview.accounts || []).forEach(function (account) {
       var machines = account.machines || [];
       counts[account.alias] = {
         total: machines.length,
         running: machines.filter(function (m) { return m.state === 'running'; }).length,
-        ok: account.ok !== false,
+        ok: account.ok !== false && !account.lastError,
       };
     });
-    accountsEl.innerHTML = state.accounts.map(function (account) {
+    return counts;
+  }
+
+  function padIndex(value) {
+    var text = String(value || 0);
+    while (text.length < 3) text = '0' + text;
+    return text;
+  }
+
+  function renderGroupBar() {
+    var bar = $('#group-bar');
+    if (!bar) return;
+    var items = ['<button class="group-chip' + (state.activeGroup ? '' : ' active') + '" data-act="pick-group" data-group="" title="显示全部账号">全部</button>'];
+    state.groups.forEach(function (group) {
+      var count = groupAliases(group).length;
+      var active = state.activeGroup === group.id;
+      items.push([
+        '<span class="group-chip' + (active ? ' active' : '') + '" data-act="pick-group" data-group="' + esc(group.id) + '" role="button" tabindex="0" title="' + esc(group.name + ' · ' + count + ' 个账号') + '">',
+        '<span class="name">' + esc(group.name) + '</span>',
+        '<span class="count">' + count + '</span>',
+        '<span class="g-edit" data-act="edit-group" data-group="' + esc(group.id) + '" title="编辑分组">' + icon('settings') + '</span>',
+        '</span>',
+      ].join(''));
+    });
+    items.push('<button class="group-chip add" data-act="edit-group" data-group="" title="新建分组">+ 分组</button>');
+    if (state.activeGroup) {
+      items.push('<button class="small-btn" data-act="matrix" title="对本组机器打开矩阵看板">矩阵</button>');
+      items.push('<button class="small-btn" data-act="matrix-recycle" title="对本组运行中的机器回收">回收</button>');
+    }
+    bar.innerHTML = items.join('');
+  }
+
+  function accountChip(account, counts, index) {
+    var count = counts[account.alias] || { total: 0, running: 0, ok: true };
+    var meta = accountMeta(account);
+    var classes = ['account-chip'];
+    if (!state.activeGroup && state.selected === account.alias) classes.push('active');
+    if (!count.ok) classes.push('error');
+    return [
+      '<div class="' + classes.join(' ') + '" data-act="pick-account" data-account="' + esc(account.alias) + '" role="button" tabindex="0">',
+      '<span class="idx">' + padIndex(index) + '</span>',
+      '<span class="dot"></span>',
+      '<span class="alias">' + esc(account.alias) + '</span>',
+      '<span class="org">' + esc(meta.org) + '</span>',
+      '<span class="tag">' + count.running + '/' + count.total + '</span>',
+      '<button class="tag" data-act="edit-account" data-account="' + esc(account.alias) + '" title="账号设置" style="border:0;background:transparent;cursor:pointer">' + icon('settings') + '</button>',
+      '</div>',
+    ].join('');
+  }
+
+  function accountRow(account, counts, index) {
+    var count = counts[account.alias] || { total: 0, running: 0, ok: true };
+    var meta = accountMeta(account);
+    var classes = ['account-row'];
+    if (!state.activeGroup && state.selected === account.alias) classes.push('active');
+    if (!count.ok) classes.push('error');
+    return [
+      '<div class="' + classes.join(' ') + '" data-act="pick-account" data-account="' + esc(account.alias) + '" role="button" tabindex="0">',
+      '<span class="idx">' + padIndex(index) + '</span>',
+      '<span class="dot"></span>',
+      '<span class="alias">' + esc(account.alias) + '</span>',
+      '<span class="org">' + esc(meta.org) + '</span>',
+      '<span class="num">' + count.running + ' / ' + count.total + '</span>',
+      '<span class="state ' + (count.ok ? 'ok' : 'bad') + '">' + (count.ok ? 'OK' : 'ERR') + '</span>',
+      '<button class="settings" data-act="edit-account" data-account="' + esc(account.alias) + '" title="账号设置">' + icon('settings') + '</button>',
+      '</div>',
+    ].join('');
+  }
+
+  function accountTable(list, counts, indexes) {
+    var head = '<thead><tr><th class="idx">#</th><th></th><th>账号</th><th>组织 / 身份</th><th class="num">运行</th><th class="num">机器</th><th>状态</th><th></th></tr></thead>';
+    var rows = list.map(function (account) {
       var count = counts[account.alias] || { total: 0, running: 0, ok: true };
-      var identity = account.identity || {};
-      var org = identity.org ? (identity.org.name || identity.org.id) : (identity.login || identity.email || '未验证');
-      var classes = ['account-chip'];
-      if (state.selected === account.alias) classes.push('active');
-      if (!count.ok || account.lastError) classes.push('error');
+      var meta = accountMeta(account);
+      var classes = [];
+      if (!state.activeGroup && state.selected === account.alias) classes.push('active');
+      if (!count.ok) classes.push('error');
       return [
-        '<div class="' + classes.join(' ') + '" data-act="pick-account" data-account="' + esc(account.alias) + '" role="button" tabindex="0">',
-        '<span class="dot"></span>',
-        '<span class="alias">' + esc(account.alias) + '</span>',
-        '<span class="org">' + esc(org) + '</span>',
-        '<span class="tag">' + count.running + '/' + count.total + '</span>',
-        '<button class="tag" data-act="edit-account" data-account="' + esc(account.alias) + '" title="账号设置" style="border:0;background:transparent;cursor:pointer">' + icon('settings') + '</button>',
-        '</div>',
+        '<tr' + (classes.length ? ' class="' + classes.join(' ') + '"' : '') + ' data-act="pick-account" data-account="' + esc(account.alias) + '" tabindex="0">',
+        '<td class="idx">' + padIndex(indexes[account.alias]) + '</td>',
+        '<td><span class="dot"></span></td>',
+        '<td class="alias">' + esc(account.alias) + '</td>',
+        '<td>' + esc(meta.org) + '</td>',
+        '<td class="num">' + count.running + '</td>',
+        '<td class="num">' + count.total + '</td>',
+        '<td><span class="state ' + (count.ok ? 'ok' : 'bad') + '">' + (count.ok ? 'OK' : 'ERROR') + '</span></td>',
+        '<td><button class="settings" data-act="edit-account" data-account="' + esc(account.alias) + '" title="账号设置">' + icon('settings') + '</button></td>',
+        '</tr>',
       ].join('');
     }).join('');
+    return '<table class="accounts-table">' + head + '<tbody>' + rows + '</tbody></table>';
+  }
+
+  function renderAccounts() {
+    if (!accountsEl) return;
+    renderGroupBar();
+    var countEl = $('#accounts-count');
+    var toggleEl = $('#accounts-toggle');
+    if (!state.accountView) {
+      state.accountView = readPref('o2a.accounts.view', state.accounts.length > 24 ? 'list' : 'chips');
+      if (['chips', 'list', 'table'].indexOf(state.accountView) < 0) state.accountView = 'chips';
+    }
+    if (toggleEl) toggleEl.textContent = state.accountsCollapsed ? '展开' : '收起';
+    accountsEl.classList.toggle('collapsed', state.accountsCollapsed);
+    if (!state.accounts.length) {
+      accountsEl.innerHTML = '';
+      accountsEl.className = 'accounts-body';
+      if (countEl) countEl.textContent = '';
+      return;
+    }
+    var counts = accountCounts();
+    var indexes = {};
+    state.accounts.forEach(function (account, index) { indexes[account.alias] = index + 1; });
+    var members = null;
+    if (state.activeGroup) {
+      var group = groupById(state.activeGroup);
+      if (group) {
+        members = {};
+        groupAliases(group).forEach(function (alias) { members[alias] = true; });
+      } else {
+        state.activeGroup = '';
+      }
+    }
+    var needle = state.accountFilter.trim().toLowerCase();
+    var list = state.accounts.filter(function (account) {
+      if (members && !members[account.alias]) return false;
+      if (!needle) return true;
+      return accountMeta(account).needle.indexOf(needle) >= 0;
+    });
+    if (countEl) {
+      if (state.activeGroup) countEl.textContent = '组内 ' + list.length + ' / 共 ' + state.accounts.length;
+      else countEl.textContent = (list.length === state.accounts.length)
+        ? ('共 ' + state.accounts.length + ' 个')
+        : (list.length + ' / ' + state.accounts.length + ' 个');
+    }
+    var shown = list.slice(0, state.accountLimit);
+    var hidden = list.length - shown.length;
+    var html;
+    if (state.accountView === 'table') html = accountTable(shown, counts, indexes);
+    else if (state.accountView === 'list') html = shown.map(function (account) { return accountRow(account, counts, indexes[account.alias]); }).join('');
+    else html = shown.map(function (account) { return accountChip(account, counts, indexes[account.alias]); }).join('');
+    if (!shown.length) html = '<div class="accounts-empty">没有匹配的账号</div>';
+    if (hidden > 0) html += '<button class="small-btn accounts-more" data-act="accounts-more">显示更多（还有 ' + hidden + ' 个）</button>';
+    accountsEl.className = 'accounts-body view-' + state.accountView;
+    if (state.accountsCollapsed) accountsEl.classList.add('collapsed');
+    accountsEl.innerHTML = html;
+    Array.prototype.forEach.call(document.querySelectorAll('[data-act="account-view"]'), function (button) {
+      button.classList.toggle('active', button.dataset.view === state.accountView);
+    });
   }
 
   function renderStats() {
@@ -1179,6 +1524,8 @@
     var spec = state.modal;
     if (!spec) { root.innerHTML = ''; return; }
     if (spec.kind === 'account') return renderAccountModal(root, spec);
+    if (spec.kind === 'group') return renderGroupModal(root, spec);
+    if (spec.kind === 'group') return renderGroupModal(root, spec);
     if (spec.kind === 'create') return renderCreateModal(root, spec);
     if (spec.kind === 'fork') return renderForkModal(root, spec);
     if (spec.kind === 'settings') return renderSettingsModal(root, spec);
@@ -1217,6 +1564,201 @@
     actions.push('<button class="ghost-btn" data-act="close-modal">取消</button>');
     actions.push('<button class="primary-btn" data-act="save-account" data-alias="' + esc(spec.alias || '') + '">' + icon('check') + '保存</button>');
     root.innerHTML = modalShell(editing ? ('编辑账号 · ' + spec.alias) : '添加 Instabox 账号', 'agent', body, actions.join(''));
+  }
+
+  function openGroupModal(id) {
+    var group = id ? groupById(id) : null;
+    state.groupDraft = {
+      id: group ? group.id : newGroupId(),
+      name: group ? group.name : '',
+      members: group ? groupAliases(group).slice() : [],
+    };
+    openModal({ kind: 'group' });
+  }
+
+  function renderGroupModal(root, spec) {
+    var draft = state.groupDraft || { id: '', name: '', members: [] };
+    var editing = Boolean(groupById(draft.id));
+    var picked = {};
+    draft.members.forEach(function (alias) { picked[alias] = true; });
+    var members = state.accounts.map(function (account) {
+      var meta = accountMeta(account);
+      return [
+        '<label class="group-member' + (picked[account.alias] ? ' picked' : '') + '" data-member="' + esc(account.alias) + '">',
+        '<input type="checkbox" data-group-member="' + esc(account.alias) + '"' + (picked[account.alias] ? ' checked' : '') + ' />',
+        '<span class="alias">' + esc(account.alias) + '</span>',
+        '<span class="org">' + esc(meta.org) + '</span>',
+        '</label>',
+      ].join('');
+    }).join('');
+    var body = [
+      '<div class="group-modal-bar">',
+      '<input class="input" id="group-name" maxlength="40" placeholder="分组名称，例如 project-a" value="' + esc(draft.name) + '" />',
+      '<input class="input" id="group-member-filter" placeholder="搜索账号…" autocomplete="off" />',
+      '</div>',
+      '<div class="group-modal-tools">',
+      '<span class="group-picked" id="group-picked-count">已选 ' + draft.members.length + ' / ' + state.accounts.length + '</span>',
+      '<button class="small-btn" data-act="group-select-visible">全选可见</button>',
+      '<button class="small-btn" data-act="group-clear">清空</button>',
+      '</div>',
+      '<div class="group-members" id="group-members">' + (members || '<div class="accounts-empty">还没有账号</div>') + '</div>',
+    ].join('');
+    var actions = [];
+    if (editing) actions.push('<button class="danger-btn" data-act="delete-group" data-group="' + esc(draft.id) + '">' + icon('trash') + '删除分组</button>');
+    actions.push('<span style="flex:1 1 auto"></span>');
+    actions.push('<button class="ghost-btn" data-act="close-modal">取消</button>');
+    actions.push('<button class="primary-btn" data-act="save-group" data-group="' + esc(draft.id) + '">' + icon('check') + '保存</button>');
+    root.innerHTML = modalShell(editing ? ('编辑分组 · ' + draft.name) : '新建账号分组', 'agent', body, actions.join(''), true);
+  }
+
+  function groupMemberInputs() {
+    return Array.prototype.slice.call(document.querySelectorAll('[data-group-member]'));
+  }
+
+  function syncGroupPicked() {
+    var draft = state.groupDraft;
+    if (!draft) return;
+    var picked = groupMemberInputs().filter(function (input) { return input.checked; }).map(function (input) { return input.dataset.groupMember; });
+    draft.members = picked;
+    groupMemberInputs().forEach(function (input) {
+      var row = input.closest('.group-member');
+      if (row) row.classList.toggle('picked', input.checked);
+    });
+    var label = $('#group-picked-count');
+    if (label) label.textContent = '已选 ' + picked.length + ' / ' + state.accounts.length;
+  }
+
+  function selectGroupVisible() {
+    groupMemberInputs().forEach(function (input) {
+      var row = input.closest('.group-member');
+      if (!row || row.hidden) return;
+      input.checked = true;
+    });
+    syncGroupPicked();
+  }
+
+  function clearGroupMembers() {
+    groupMemberInputs().forEach(function (input) { input.checked = false; });
+    syncGroupPicked();
+  }
+
+  function filterGroupMembers(value) {
+    var needle = String(value || '').trim().toLowerCase();
+    Array.prototype.forEach.call(document.querySelectorAll('#group-members .group-member'), function (row) {
+      if (!needle) { row.hidden = false; return; }
+      var text = [row.dataset.member, row.textContent].join(' ').toLowerCase();
+      row.hidden = text.indexOf(needle) < 0;
+    });
+  }
+
+  function saveGroupForm() {
+    var draft = state.groupDraft;
+    if (!draft) return;
+    var nameEl = $('#group-name');
+    var name = ((nameEl && nameEl.value) || '').trim();
+    if (!name) { toast('分组需要一个名字', 'error'); if (nameEl) nameEl.focus(); return; }
+    var members = groupMemberInputs().filter(function (input) { return input.checked; }).map(function (input) { return input.dataset.groupMember; });
+    var existing = groupById(draft.id);
+    if (existing) {
+      existing.name = name;
+      existing.accounts = members;
+    } else {
+      state.groups.push({ id: draft.id, name: name, accounts: members });
+    }
+    saveGroups();
+    delete state.overviewCache['g:' + draft.id];
+    delete state.overviewCacheAt['g:' + draft.id];
+    state.groupDraft = null;
+    closeModal();
+    if (state.activeGroup === draft.id) refresh({ force: true });
+    else render();
+    toast('已保存分组「' + name + '」· ' + members.length + ' 个账号', 'ok');
+  }
+
+  function deleteGroupForm() {
+    var draft = state.groupDraft;
+    if (!draft) return;
+    var existing = groupById(draft.id);
+    if (!existing) { closeModal(); return; }
+    if (!window.confirm('删除分组「' + existing.name + '」？账号本身不会被删除。')) return;
+    state.groups = state.groups.filter(function (group) { return group.id !== draft.id; });
+    saveGroups();
+    delete state.overviewCache['g:' + draft.id];
+    delete state.overviewCacheAt['g:' + draft.id];
+    state.groupDraft = null;
+    closeModal();
+    if (state.activeGroup === draft.id) {
+      state.activeGroup = '';
+      writePref('o2a.rail.group', '');
+      selectAccount('all');
+      toast('分组已删除', 'ok');
+      return;
+    }
+    render();
+    toast('分组已删除', 'ok');
+  }
+
+  function clampRail(width) {
+    var room = window.innerWidth - 420;
+    var max = Math.max(200, Math.min(560, room));
+    return Math.max(200, Math.min(max, Math.round(Number(width) || 260)));
+  }
+
+  function applyRail() {
+    var workspace = $('#workspace');
+    if (!workspace) return;
+    state.railWidth = clampRail(state.railWidth);
+    workspace.style.setProperty('--rail-w', state.railWidth + 'px');
+    workspace.classList.toggle('rail-collapsed', Boolean(state.railCollapsed));
+    var toggle = document.querySelector('[data-act="rail-toggle"]');
+    if (toggle) {
+      toggle.title = state.railCollapsed ? '展开账号栏' : '折叠账号栏';
+      toggle.setAttribute('aria-label', toggle.title);
+      toggle.setAttribute('aria-expanded', state.railCollapsed ? 'false' : 'true');
+      toggle.classList.toggle('rail-off', Boolean(state.railCollapsed));
+    }
+  }
+
+  function toggleRail() {
+    state.railCollapsed = !state.railCollapsed;
+    writePref('o2a.rail.collapsed', state.railCollapsed ? '1' : '0');
+    applyRail();
+  }
+
+  function bindRail() {
+    var resizer = $('#rail-resizer');
+    if (!resizer) return;
+    var dragging = false;
+    resizer.addEventListener('pointerdown', function (event) {
+      if (event.button !== 0) return;
+      dragging = true;
+      resizer.classList.add('dragging');
+      try { resizer.setPointerCapture(event.pointerId); } catch (error) { /* ignore */ }
+      event.preventDefault();
+    });
+    resizer.addEventListener('pointermove', function (event) {
+      if (!dragging) return;
+      var workspace = $('#workspace');
+      if (!workspace) return;
+      var left = workspace.getBoundingClientRect().left;
+      state.railWidth = clampRail(event.clientX - left);
+      workspace.style.setProperty('--rail-w', state.railWidth + 'px');
+    });
+    var stop = function (event) {
+      if (!dragging) return;
+      dragging = false;
+      resizer.classList.remove('dragging');
+      try { resizer.releasePointerCapture(event.pointerId); } catch (error) { /* ignore */ }
+      writePref('o2a.rail.width', String(state.railWidth));
+    };
+    resizer.addEventListener('pointerup', stop);
+    resizer.addEventListener('pointercancel', stop);
+    resizer.addEventListener('dblclick', function () {
+      state.railWidth = 260;
+      applyRail();
+      writePref('o2a.rail.width', '260');
+    });
+    window.addEventListener('resize', function () { applyRail(); });
   }
 
   function renderCreateModal(root, spec) {
@@ -3516,10 +4058,12 @@
     if (!window.confirm('移除账号 ' + alias + '？本机保存的 API Key 会被删除。')) return;
     await withButton(button, async function () {
       await service('DELETE', '/api/accounts/' + encodeURIComponent(alias), { timeoutMs: 30000 });
+      delete state.overviewCache[alias];
+      delete state.overviewCacheAt[alias];
       await loadBootstrap();
       closeModal();
       toast('账号已移除', 'success');
-      refresh({ silent: true });
+      refresh({ silent: true, force: true });
     });
   }
 
@@ -3582,13 +4126,27 @@
         return;
       }
       if (act === 'pick-account') {
-        state.selected = el.dataset.account || 'all';
-        var select = $('#account-select');
-        if (select) select.value = state.selected;
-        render();
-        refresh();
+        selectAccount(el.dataset.account || 'all');
         return;
       }
+      if (act === 'account-view') { setAccountView(el.dataset.view); return; }
+      if (act === 'accounts-toggle') {
+        state.accountsCollapsed = !state.accountsCollapsed;
+        renderAccounts();
+        return;
+      }
+      if (act === 'accounts-more') {
+        state.accountLimit += 80;
+        renderAccounts();
+        return;
+      }
+      if (act === 'rail-toggle') { toggleRail(); return; }
+      if (act === 'pick-group') { selectGroup(el.dataset.group || ''); return; }
+      if (act === 'edit-group') { openGroupModal(el.dataset.group || ''); return; }
+      if (act === 'save-group') { saveGroupForm(); return; }
+      if (act === 'delete-group') { deleteGroupForm(); return; }
+      if (act === 'group-select-visible') { selectGroupVisible(); return; }
+      if (act === 'group-clear') { clearGroupMembers(); return; }
       if (act === 'close-modal') { closeModal(); return; }
       if (act === 'copy') { copyText(el.dataset.copy, el.title || ''); return; }
       if (act === 'power') {
@@ -3678,9 +4236,11 @@
 
     document.addEventListener('change', function (event) {
       var target = event.target;
+      if (target && target.dataset && target.dataset.groupMember) { syncGroupPicked(); return; }
       if (target && target.id === 'file-upload-input') { void handleFileUpload(target); return; }
       if (target && target.id === 'create-account') { loadTemplates(target.value); return; }
       if (target && target.id === 'create-template') { prefillTemplate(target); return; }
+      if (target && target.dataset && target.dataset.groupMember) { syncGroupPicked(); return; }
       var el = event.target.closest('[data-change]');
       if (!el) return;
       if (el.dataset.change === 'keepalive-toggle') toggleKeepalive(el);
@@ -3690,23 +4250,46 @@
     });
 
     document.addEventListener('input', function (event) {
-      if (event.target && event.target.id === 'filter-input') {
+      if (!event.target) return;
+      if (event.target.id === 'filter-input') {
         state.filter = event.target.value || '';
         renderGrid();
+        return;
+      }
+      if (event.target.id === 'group-member-filter') {
+        filterGroupMembers(event.target.value);
+        return;
+      }
+      if (event.target.id === 'account-filter') {
+        state.accountFilter = event.target.value || '';
+        state.accountLimit = 80;
+        renderAccounts();
+        return;
       }
     });
 
     var select = $('#account-select');
     if (select) {
       select.addEventListener('change', function () {
-        state.selected = select.value || 'all';
-        render();
-        refresh();
+        var value = select.value || 'all';
+        if (value.indexOf('g:') === 0) selectGroup(value.slice(2));
+        else selectAccount(value);
       });
     }
 
     document.addEventListener('keydown', function (event) {
-      if (event.key === 'Escape' && state.modal) closeModal();
+      if (event.key === 'Escape' && state.modal) { closeModal(); return; }
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      var target = event.target && event.target.closest ? event.target.closest('.group-chip[data-act="pick-group"]') : null;
+      if (target && event.target === target) {
+        event.preventDefault();
+        selectGroup(target.dataset.group || '');
+        return;
+      }
+      var row = event.target && event.target.closest ? event.target.closest('[data-act="pick-account"]') : null;
+      if (!row || event.target !== row) return;
+      event.preventDefault();
+      selectAccount(row.dataset.account || 'all');
     });
 
     document.addEventListener('visibilitychange', function () {
@@ -3720,10 +4303,21 @@
 
   async function boot() {
     bind();
+    bindRail();
+    state.groups = loadGroups();
+    state.railWidth = clampRail(readPref('o2a.rail.width', 260));
+    state.railCollapsed = readPref('o2a.rail.collapsed', '0') === '1';
+    applyRail();
+    var savedGroup = readPref('o2a.rail.group', '');
+    if (savedGroup && groupById(savedGroup)) state.activeGroup = savedGroup;
     try {
       await loadBootstrap();
     } catch (error) {
       /* loadBootstrap already recorded the error and rendered */
+    }
+    if (state.activeGroup && !groupById(state.activeGroup)) {
+      state.activeGroup = '';
+      writePref('o2a.rail.group', '');
     }
     try {
       await refresh();

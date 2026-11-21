@@ -877,8 +877,15 @@ async function route(req, res, url) {
   }
 
   if (method === 'POST' && path === '/api/keepalive/tick') {
-    const patches = await keepalive.tick();
-    return send(res, 200, { ok: true, patches });
+    let scope = null;
+    try {
+      const body = await readBody(req);
+      if (body && Array.isArray(body.accounts) && body.accounts.length) scope = body.accounts.map(String);
+    } catch (error) {
+      scope = null;
+    }
+    const patches = await keepalive.tick(Date.now(), scope);
+    return send(res, 200, { ok: true, patches, scope: scope || 'all' });
   }
 
   if (method === 'GET' && path === '/api/recycle') {
