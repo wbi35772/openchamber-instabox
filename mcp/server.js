@@ -116,6 +116,7 @@ async function resolveMachineId(api, value) {
 
 const netprobe = createNetProbe();
 const egress = createEgressClient({ log });
+egress.subscribe({});
 const cfBridge = createCfBridge({ log });
 const proxies = createAccountProxy({ getState: () => store.load(), log, egress });
 const rateLimiter = createRateLimiter();
@@ -1504,13 +1505,22 @@ function tunnelDomainZoneFor(state, hostname) {
   return parts.length > 1 ? parts.slice(1).join('.').toLowerCase() : '';
 }
 
-function matrixSlotStatusTool(args) {
+async function matrixSlotStatusTool(args) {
   const state = store.load();
   const alias = String(args.account || '').trim();
   const list = alias
     ? [resolveAccount(state, alias)]
     : state.accounts.filter((account) => account.enabled !== false);
   const live = egress.status();
+  let liveSlots = null;
+  let liveError = null;
+  if (args.live !== false) {
+    try {
+      liveSlots = await egress.slots();
+    } catch (error) {
+      liveError = error.message;
+    }
+  }
   const accounts = list.map((account) => {
     let target = null;
     let error = null;
@@ -1539,30 +1549,16 @@ function matrixSlotStatusTool(args) {
       error,
     };
   });
-  if (args.live === true) {
-    return egress.slots()
-      .then((slots) => ok(JSON.stringify({
-        ok: true,
-        bus: live.baseUrl,
-        connected: live.connected,
-        accounts,
-        slots,
-      }, null, 2)))
-      .catch((error) => ok(JSON.stringify({
-        ok: false,
-        bus: live.baseUrl,
-        connected: live.connected,
-        error: error.message,
-        accounts,
-      }, null, 2)));
-  }
-  return ok(JSON.stringify({
+  const payload = {
     ok: true,
     bus: live.baseUrl,
     connected: live.connected,
     frozenSlots: live.frozenSlots,
     accounts,
-  }, null, 2));
+  };
+  if (liveSlots) payload.slots = liveSlots;
+  if (liveError) payload.error = liveError;
+  return ok(JSON.stringify(payload, null, 2));
 }
 
 async function cfTunnelTool(args) {
